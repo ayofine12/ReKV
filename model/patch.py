@@ -1,5 +1,8 @@
 import torch
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+from transformers.models.llama.modeling_llama import LlamaModel
+from transformers.models.mistral.modeling_mistral import MistralModel
+from transformers.models.qwen2.modeling_qwen2 import Qwen2Model as Qwen2BaseModel
 
 from model.attention import RotaryEmbeddingESM, rekv_attention_forward
 
@@ -16,11 +19,27 @@ def huggingface_forward(forward):
         **kwargs,
     ):
         assert not output_attentions
+        # Safely access attributes, falling back to config if needed
+        num_heads = getattr(self, 'num_heads', None)
+        if num_heads is None:
+            num_heads = self.config.num_attention_heads
+        
+        num_key_value_heads = getattr(self, 'num_key_value_heads', None)
+        if num_key_value_heads is None:
+            num_key_value_heads = getattr(self.config, 'num_key_value_heads', num_heads)
+        
+        head_dim = getattr(self, 'head_dim', None)
+        if head_dim is None:
+            hidden_size = getattr(self, 'hidden_size', None)
+            if hidden_size is None:
+                hidden_size = self.config.hidden_size
+            head_dim = hidden_size // num_heads
+        
         ret = forward(
             self, hidden_states, hidden_states,
             position_ids, use_cache, past_key_value,
             self.q_proj, self.k_proj, self.v_proj, self.o_proj, 
-            self.head_dim, self.num_heads, self.num_key_value_heads
+            head_dim, num_heads, num_key_value_heads
         )
         if use_cache:
             o, pkv = ret
@@ -132,47 +151,144 @@ def patch_hf(
         )
 
     forward = huggingface_forward(rekv_attention_forward(**attn_kwargs))
+    
+    # Patch LlamaDecoderLayer.forward to handle 3 return values from self_attn
+    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+    from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+    
+    def decoder_layer_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask = None,
+        position_ids = None,
+        past_key_value = None,  # Support both old and new parameter names
+        use_cache = False,
+        cache_position = None,
+        position_embeddings = None,
+        output_attentions = False,
+        **kwargs,
+    ):
+        
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        # Self Attention - unpack 3 values: (attn_output, attn_weights, past_key_value)
+        hidden_states, _, past_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            output_attentions=output_attentions,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
 
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        
+        # Return format to match model_forward expectations:
+        # - output_attentions=False, use_cache=True: (hidden_states, past_key_value)
+        # - output_attentions=True, use_cache=True: (hidden_states, attn_weights, past_key_value)
+        # - use_cache=False: (hidden_states,) or (hidden_states, attn_weights)
+        if use_cache:
+            if output_attentions:
+                return hidden_states, None, past_key_value
+            else:
+                return hidden_states, past_key_value
+        else:
+            if output_attentions:
+                return hidden_states, None
+            else:
+                return hidden_states
+    
     if isinstance(model, LlamaForCausalLM):
         Attention = model.model.layers[0].self_attn.__class__
         Model = model.model.__class__
+        base_model = model.model
+    elif isinstance(model, LlamaModel):
+        # LlamaModel directly has layers attribute (not model.model.layers)
+        Attention = model.layers[0].self_attn.__class__
+        Model = model.__class__
+        base_model = model
     elif isinstance(model, MistralForCausalLM):
         Attention = model.model.layers[0].self_attn.__class__
         Model = model.model.__class__
-    elif isinstance(model, Qwen2ForCausalLM) or isinstance(model, Qwen2Model):
+        base_model = model.model
+    elif isinstance(model, MistralModel):
+        Attention = model.layers[0].self_attn.__class__
+        Model = model.__class__
+        base_model = model
+    elif isinstance(model, Qwen2ForCausalLM):
         Attention = model.model.layers[0].self_attn.__class__
         Model = model.model.__class__
+        base_model = model.model
+    elif isinstance(model, Qwen2Model):
+        Attention = model.model.layers[0].self_attn.__class__
+        Model = model.model.__class__
+        base_model = model.model
+    elif isinstance(model, Qwen2BaseModel):
+        Attention = model.layers[0].self_attn.__class__
+        Model = model.__class__
+        base_model = model
     elif model.__class__.__name__ == "MiniCPMForCausalLM":
         Attention = model.model.layers[0].self_attn.__class__
         Model = model.model.__class__
+        base_model = model.model
     else:
         raise ValueError(f"Only supports llama, mistral and qwen2 models, not {model.__class__.__name__}.")
 
-    hf_rope = model.model.layers[0].self_attn.rotary_emb 
-    if isinstance(hf_rope, Qwen2RotaryEmbedding):
-        base = hf_rope.base
-        distance_scale = 1.0
-        dim = hf_rope.dim
+    # In newer transformers versions, rotary_emb might not be an attribute of attention
+    # We get RoPE parameters from config instead
+    attention = base_model.layers[0].self_attn
+    config = attention.config
+    
+    if hasattr(attention, 'rotary_emb'):
+        # Old transformers: rotary_emb exists
+        hf_rope = attention.rotary_emb
+        if isinstance(hf_rope, Qwen2RotaryEmbedding):
+            base = hf_rope.base
+            distance_scale = 1.0
+            dim = hf_rope.dim
+        else:
+            base = hf_rope.config.rope_theta
+            distance_scale = distance_scale if distance_scale is not None else 1.0
+            partial_rotary_factor = hf_rope.config.partial_rotary_factor if hasattr(hf_rope.config, "partial_rotary_factor") else 1.0
+            dim = int((hf_rope.config.hidden_size // hf_rope.config.num_attention_heads) * partial_rotary_factor)
     else:
-        base = hf_rope.config.rope_theta
+        # New transformers: get RoPE parameters from config
+        base = getattr(config, 'rope_theta', 10000.0)
         distance_scale = distance_scale if distance_scale is not None else 1.0
-        partial_rotary_factor = hf_rope.config.partial_rotary_factor if hasattr(hf_rope.config, "partial_rotary_factor") else 1.0
-        dim = int((hf_rope.config.hidden_size // hf_rope.config.num_attention_heads) * partial_rotary_factor)
+        partial_rotary_factor = getattr(config, 'partial_rotary_factor', 1.0)
+        
+        # Calculate dim based on head_dim or hidden_size
+        if hasattr(attention, 'head_dim'):
+            dim = int(attention.head_dim * partial_rotary_factor)
+        else:
+            dim = int((config.hidden_size // config.num_attention_heads) * partial_rotary_factor)
     rope = RotaryEmbeddingESM(
         dim,
         base,
         distance_scale
     )
-    model.model.position_bias = rope
+    base_model.position_bias = rope
 
-    def set_forward(m):
+    def set_forward(m): # m is module object
         if isinstance(m, Attention):
             m._old_forward = m.forward
             m.forward = forward.__get__(m, Attention)
+        elif isinstance(m, (LlamaDecoderLayer, MistralDecoderLayer, Qwen2DecoderLayer)):
+            m._old_forward = m.forward
+            m.forward = decoder_layer_forward.__get__(m, m.__class__)
 
     model.apply(set_forward)
 
-    model.model._old_forward = model.model.forward
-    model.model.forward = model_forward.__get__(model.model, Model)
+    base_model._old_forward = base_model.forward
+    base_model.forward = model_forward.__get__(base_model, Model)
 
     return model

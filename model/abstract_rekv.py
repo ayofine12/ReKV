@@ -25,6 +25,7 @@ class Abstract_ReKV:
             self.init_prompt_ids = torch.as_tensor([self.init_prompt_ids], device=self.device)
         output = self.language_model(input_ids=self.init_prompt_ids, use_cache=True, return_dict=True)
         self.kv_cache = output.past_key_values
+        return
 
     def _get_video_features(self, pixel_values_videos):
         pass
@@ -36,6 +37,7 @@ class Abstract_ReKV:
 
         output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
         self.kv_cache = output.past_key_values
+        return
 
     @torch.inference_mode()
     def encode_video(self, video, encode_chunk_size=64):  # video: (Nv, H, W, 3)
@@ -48,7 +50,7 @@ class Abstract_ReKV:
             end_idx = start_idx + encode_chunk_size
             chunk_video = video[start_idx:end_idx]
             self._encode_video_chunk(chunk_video)
-            logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.1f} GB')
+            logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.3f} GB')
 
         # Handle remaining frames
         remaining_frames = num_frames % encode_chunk_size

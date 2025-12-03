@@ -18,24 +18,104 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
             prompt += ' Best option: ('
         return prompt
 
+    def get_kv_cache_info(self):
+        """KV 캐시 상태 정보를 반환합니다.
+        
+        Returns:
+            dict: KV 캐시 상태 정보
+                - total_tokens: 전체 토큰 수 (모든 레이어의 평균)
+                - num_layers: 레이어 수
+                - local_kv_size: Local KV 캐시 크기 (토큰 수)
+                - global_remainder_size: Global remainder 크기 (토큰 수)
+                - num_global_blocks: CPU에 저장된 global block 수
+                - init_exc: Init KV 캐시가 가득 찼는지 여부
+                - cpu_memory_gb: CPU 메모리 사용량 (GB)
+        """
+        if self.kv_cache is None:
+            return {
+                'total_tokens': 0,
+                'num_layers': 0,
+                'local_kv_size': 0,
+                'global_remainder_size': 0,
+                'num_global_blocks': 0,
+                'init_exc': False,
+                'cpu_memory_gb': 0.0
+            }
+        
+        # 첫 번째 레이어의 ContextManager를 사용하여 정보 수집
+        first_layer = self.kv_cache[0]
+
+        if hasattr(first_layer, 'size'):
+            global_kv_cache_size = first_layer.size()
+        else:
+            global_kv_cache_size = first_layer.length
+        
+        # # 모든 레이어의 토큰 수 확인
+        # layer_tokens = []
+        # for layer_kv in self.kv_cache:
+        #     if hasattr(layer_kv, 'size'):
+        #         layer_tokens.append(layer_kv.size())
+        #     elif hasattr(layer_kv, 'length'):
+        #         layer_tokens.append(layer_kv.length)
+        
+        # total_tokens = sum(layer_tokens) / len(layer_tokens) if layer_tokens else 0
+        
+        # 첫 번째 레이어의 상세 정보
+        local_kv_size = first_layer.local_k.size(-2) if hasattr(first_layer, 'local_k') else 0
+        global_remainder_size = first_layer.global_remainder[0].size(-2) if hasattr(first_layer, 'global_remainder') else 0
+        num_global_blocks = first_layer.num_global_block if hasattr(first_layer, 'num_global_block') else 0
+        init_exc = first_layer.init_exc if hasattr(first_layer, 'init_exc') else False
+        
+        # CPU 메모리 사용량
+        cpu_memory_gb = self.calc_memory_usage() / (1024**3) if hasattr(self, 'calc_memory_usage') else 0.0
+        
+        return {
+            'global_kv_cache_size': int(global_kv_cache_size),
+            'local_kv_size': local_kv_size,
+            'global_remainder_size': global_remainder_size,
+            'num_global_blocks': num_global_blocks,
+            'init_exc': init_exc,
+            'cpu_memory_gb': cpu_memory_gb
+        }
+    
+    def print_kv_cache_info(self):
+        """KV 캐시 상태를 출력합니다."""
+        info = self.get_kv_cache_info()
+        logger.info("=" * 60)
+        logger.info("KV Cache Status:")
+        logger.info(f"  Accumulated global KV cache size: {info['global_kv_cache_size']}")
+        logger.info(f"  Local KV cache size: {info['local_kv_size']} tokens")
+        logger.info(f"  Global remainder size: {info['global_remainder_size']} tokens")
+        logger.info(f"  Global blocks (on CPU): {info['num_global_blocks']}")
+        logger.info(f"  Init KV cache full: {info['init_exc']}")
+        logger.info(f"  CPU memory usage: {info['cpu_memory_gb']:.3f} GB")
+        logger.info("=" * 60)
+
     def _get_video_features(self, pixel_values_videos):
         batch_size, frames, channels, height, width = pixel_values_videos.shape  # (B, Nv, 3, H, W)
-        _, video_features, _ = self._get_vision_features(
-            pixel_values_videos=pixel_values_videos,
-            vision_feature_layer=self.config.vision_feature_layer,
-            vision_feature_select_strategy=self.config.vision_feature_select_strategy
-        )  # (Nv, 257, D)
-        video_features = self.multi_modal_projector(video_features)  # (Nv, 257, D)
+        # Reshape to process frames individually
+        pixel_values_videos = pixel_values_videos.view(batch_size * frames, channels, height, width)
+        video_features = self.video_tower(pixel_values_videos, output_hidden_states=True)
+        selected_video_feature = video_features.hidden_states[self.config.vision_feature_layer]
+        
+        if self.config.vision_feature_select_strategy == "default":
+            selected_video_feature = selected_video_feature[:, 1:]
+        elif self.config.vision_feature_select_strategy == "full":
+            selected_video_feature = selected_video_feature
+        
+        video_features = self.multi_modal_projector(selected_video_feature)  # (Nv, 257, D)
         video_features = video_features.reshape(batch_size, frames * video_features.shape[1], -1)  # (B, Nv*257, D)
         return video_features
     
     def _encode_video_chunk(self, video_chunk):
         pixel_values_videos = self.processor.video_processor(images=None, videos=video_chunk, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
-        video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*257, D)
+        video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*256, D)
         assert self.n_local >= video_features.shape[1], f'n_local: {self.n_local}, video_features: {video_features.shape[1]}'
-
+        logger.debug(f'video_features: {video_features.shape[1]}')
         output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
         self.kv_cache = output.past_key_values
+        self.print_kv_cache_info()
+        return
 
     @torch.inference_mode()
     def encode_video(self, video, encode_chunk_size=8):  # video: (Nv, H, W, 3)
@@ -114,9 +194,9 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         return output
 
 
-def load_model(model_path='model_zoo/Video-LLaVA-7B-hf', n_init=None, n_local=None, topk=8, chunk_size=1):
+def load_model(model_path='/mnt/models/Video-LLaVA-7B-hf', n_init=None, n_local=None, topk=8, chunk_size=1):
     device = 'cuda'
-    n_frame_tokens = 257
+    n_frame_tokens = 256
     processor = VideoLlavaProcessor.from_pretrained(model_path)
     
     init_prompt = 'USER: '
@@ -128,7 +208,7 @@ def load_model(model_path='model_zoo/Video-LLaVA-7B-hf', n_init=None, n_local=No
         'block_size': n_frame_tokens,
         'topk': topk,
         'chunk_size': chunk_size,
-        'max_cached_block': 128,
+        'max_cached_block': 16,
         'exc_block_size': n_frame_tokens,
         'pin_memory': True,
     }
@@ -144,8 +224,8 @@ def load_model(model_path='model_zoo/Video-LLaVA-7B-hf', n_init=None, n_local=No
         topk=topk,
         chunk_size=chunk_size,
     )
-    model.language_model = patch_hf(model.language_model, **inf_llm_config)
     
+    model.language_model = patch_hf(model.language_model, **inf_llm_config)
     for k, v in inf_llm_config.items():
         logger.info(f'{k}: {v}')
     logger.info(f'n_frame_tokens: {n_frame_tokens}')

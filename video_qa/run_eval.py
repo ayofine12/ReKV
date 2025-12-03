@@ -163,7 +163,7 @@ def eval_rvs_ego(args):
                     "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
-                    "--anno_path", "data/rvs/ego/ego4d_oe.json",
+                    "--anno_path", "/mnt/ssd1/mwnoh/rvs/ego/ego4d_oe.json",
                     "--debug", args.debug,
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
@@ -197,7 +197,7 @@ def eval_rvs_movie(args):
                     "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
-                    "--anno_path", "data/rvs/movie/movienet_oe.json",
+                    "--anno_path", "/mnt/ssd1/mwnoh/rvs/movie/movienet_oe.json",
                     "--debug", args.debug,
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]

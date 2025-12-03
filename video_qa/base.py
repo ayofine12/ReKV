@@ -39,11 +39,17 @@ MODELS = {
         'processor_class': LlavaOnevisionProcessor,
         'model_path': 'model_zoo/llava-onevision-qwen2-72b-ov-hf',
     },
+    # 'video_llava_7b': {
+    #     'load_func': video_llava_rekv.load_model,
+    #     'model_class': VideoLlavaForConditionalGeneration,
+    #     'processor_class': VideoLlavaProcessor,
+    #     'model_path': 'model_zoo/Video-LLaVA-7B-hf',
+    # },
     'video_llava_7b': {
-        'load_func': video_llava_rekv.load_model,
         'model_class': VideoLlavaForConditionalGeneration,
+        'load_func': video_llava_rekv.load_model,
         'processor_class': VideoLlavaProcessor,
-        'model_path': 'model_zoo/Video-LLaVA-7B-hf',
+        'model_path': '/mnt/models/Video-LLaVA-7B-hf',
     },
     'longva_7b': {
         'load_func': longva_rekv.load_model,
