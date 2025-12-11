@@ -74,7 +74,7 @@ class ReKVStreamVQA(BaseVQA):
             # encode video until receiving QA
             if temporal_windows[-1] > video_end_idx:
                 video_end_idx = temporal_windows[-1]
-                self.qa_model.encode_video(video_tensor[int(video_start_idx):int(video_end_idx)])
+                self.qa_model.encode_and_prefill_video(video_tensor[int(video_start_idx):int(video_end_idx)])
                 video_start_idx = video_end_idx
         
             # OpenQA

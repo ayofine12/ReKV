@@ -27,13 +27,35 @@ class LongVA_ReKV(LlavaQwenForCausalLM, Abstract_ReKV):
         video_features = video_features.flatten(0, 1).unsqueeze(0)  # (1, Nv*144, 3584)
         return video_features
 
-    def _encode_video_chunk(self, video_chunk):  # (Nv, H, W, 3)
+    def encode_video_chunk(self, video_chunk):  # (Nv, H, W, 3)
+        """비디오 청크를 인코딩하여 video features를 추출합니다.
+        
+        Args:
+            video_chunk: 비디오 청크 (Nv, H, W, 3)
+            
+        Returns:
+            video_features: 인코딩된 비디오 features (1, Nv*144, D)
+        """
         pixel_values_videos = self.processor.preprocess(video_chunk, return_tensors="pt").pixel_values.to(self.device, self.dtype)  # (Nv, 3, H, W)
         video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*144, D)
         assert self.n_local >= video_features.shape[1], f'n_local: {self.n_local}, video_features: {video_features.shape[1]}'
-
+        return video_features
+    
+    def video_prefill_chunk(self, video_features):
+        """Video features를 language_model에 넣어서 KV cache를 업데이트합니다.
+        
+        Args:
+            video_features: 인코딩된 비디오 features (1, Nv*144, D)
+        """
         output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
         self.kv_cache = output.past_key_values
+        return
+    
+    def _encode_video_chunk(self, video_chunk):  # (Nv, H, W, 3)
+        """기존 호환성을 위한 래퍼 함수. encode_video_chunk와 video_prefill_chunk를 순차 호출합니다."""
+        video_features = self.encode_video_chunk(video_chunk)
+        self.video_prefill_chunk(video_features)
+        return
 
     @torch.inference_mode()
     def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):

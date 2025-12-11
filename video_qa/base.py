@@ -221,6 +221,13 @@ def work(QA_CLASS):
 
     # Load ground truth file
     anno = json.load(open(args.anno_path))
+    
+    # Convert dict to list if necessary (for chunking/splitting)
+    if isinstance(anno, dict):
+        logger.info(f"Loaded annotation as dict with {len(anno)} items, converting to list")
+        anno = list(anno.values())
+    
+    logger.info(f"Total annotations: {len(anno)}")
 
     retrieve_analyzer = QA_CLASS(
         anno=anno,

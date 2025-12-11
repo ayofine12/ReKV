@@ -26,17 +26,62 @@ class FlashVStream_ReKV(VStreamLlamaForCausalLM, Abstract_ReKV):
         video_features = video_features.flatten(0, 1).unsqueeze(0)  # (1, Nv*64, 3584)
         return video_features
 
-    def _encode_video_chunk(self, video_chunk):  # (Nv, H, W, 3)
+    def encode_video_chunk(self, video_chunk):  # (Nv, H, W, 3)
+        """비디오 청크를 인코딩하여 video features를 추출합니다.
+        
+        Args:
+            video_chunk: 비디오 청크 (Nv, H, W, 3)
+            
+        Returns:
+            video_features: 인코딩된 비디오 features (1, Nv*64, D)
+        """
         pixel_values_videos = self.processor.preprocess(video_chunk, return_tensors="pt").pixel_values.to(self.device, self.dtype)  # (Nv, 3, H, W)
         video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*64, D)
         assert self.n_local >= video_features.shape[1], f'n_local: {self.n_local}, video_features: {video_features.shape[1]}'
-
+        return video_features
+    
+    def video_prefill_chunk(self, video_features):
+        """Video features를 language_model에 넣어서 KV cache를 업데이트합니다.
+        
+        Args:
+            video_features: 인코딩된 비디오 features (1, Nv*64, D)
+        """
         output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
         self.kv_cache = output.past_key_values
+        return
+    
+    def _encode_video_chunk(self, video_chunk):  # (Nv, H, W, 3)
+        """기존 호환성을 위한 래퍼 함수. encode_video_chunk와 video_prefill_chunk를 순차 호출합니다."""
+        video_features = self.encode_video_chunk(video_chunk)
+        self.video_prefill_chunk(video_features)
+        return
 
     @torch.inference_mode()
     def encode_video(self, video, encode_chunk_size=16):  # video: (Nv, H, W, 3)
-        super().encode_video(video, encode_chunk_size)
+        """비디오를 청크 단위로 인코딩하여 video features 리스트를 반환합니다.
+        
+        Args:
+            video: 비디오 프레임들 (Nv, H, W, 3)
+            encode_chunk_size: 청크 크기
+            
+        Returns:
+            video_features_list: 각 청크의 video features 리스트
+        """
+        return super().encode_video(video, encode_chunk_size)
+    
+    @torch.inference_mode()
+    def video_prefill(self, video_features_list):
+        """Video features 리스트를 language_model에 넣어서 KV cache를 업데이트합니다.
+        
+        Args:
+            video_features_list: 각 청크의 video features 리스트
+        """
+        super().video_prefill(video_features_list)
+    
+    @torch.inference_mode()
+    def encode_and_prefill_video(self, video, encode_chunk_size=16):  # video: (Nv, H, W, 3)
+        """기존 호환성을 위한 래퍼 함수. encode_video와 video_prefill을 순차 호출합니다."""
+        super().encode_and_prefill_video(video, encode_chunk_size)
 
     @torch.inference_mode()
     def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):
@@ -118,7 +163,7 @@ class FlashVStream_ReKV(VStreamLlamaForCausalLM, Abstract_ReKV):
         for prompt, next_t in inputs:
             if next_t > cur_t:
                 video_clip = video[cur_t:next_t]
-                self.encode_video(video_clip)
+                self.encode_and_prefill_video(video_clip)
                 cur_t = next_t
             self.question_answering(prompt)
 

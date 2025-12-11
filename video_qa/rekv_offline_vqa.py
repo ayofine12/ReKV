@@ -39,7 +39,7 @@ class ReKVOfflineVQA(BaseVQA):
 
         self.qa_model.clear_cache()
         self.qa_model.encode_init_prompt()
-        self.qa_model.encode_video(video_tensor)
+        self.qa_model.encode_and_prefill_video(video_tensor)
 
         for sample in video_sample['conversations']:
             logger.debug(f'sample: {sample}')
