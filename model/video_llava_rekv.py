@@ -91,6 +91,7 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         logger.info(f"  CPU memory usage: {info['cpu_memory_gb']:.3f} GB")
         logger.info("=" * 60)
 
+    @torch.inference_mode()
     def _get_video_features(self, pixel_values_videos):
         batch_size, frames, channels, height, width = pixel_values_videos.shape  # (B, Nv, 3, H, W)
         # Reshape to process frames individually
@@ -107,6 +108,7 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         video_features = video_features.reshape(batch_size, frames * video_features.shape[1], -1)  # (B, Nv*257, D)
         return video_features
     
+    @torch.inference_mode()
     def encode_video_chunk(self, video_chunk):
         """비디오 청크를 인코딩하여 video features를 추출합니다.
         
@@ -118,39 +120,41 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         """
         pixel_values_videos = self.processor.video_processor(images=None, videos=video_chunk, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
         video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*256, D)
-        assert self.n_local >= video_features.shape[1], f'n_local: {self.n_local}, video_features: {video_features.shape[1]}'
+        if self.n_local < video_features.shape[1]:
+            logger.warning(f'n_local ({self.n_local}) is smaller than video_features tokens ({video_features.shape[1]}). Video will be truncated during prefill.')
         logger.debug(f'video_features: {video_features.shape[1]}')
         return video_features
     
+    @torch.inference_mode()
     def video_prefill_chunk(self, video_features):
         """Video features를 language_model에 넣어서 KV cache를 업데이트합니다.
         
         Args:
             video_features: 인코딩된 비디오 features (1, Nv*256, D)
         """
-        output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
-        self.kv_cache = output.past_key_values
+        num_tokens = video_features.shape[1]
+        
+        # n_local보다 큰 경우 n_local 크기만큼 반복해서 모든 토큰 처리
+        if num_tokens > self.n_local:
+            logger.debug(f'video_features has {num_tokens} tokens, processing in chunks of {self.n_local}')
+            start_idx = 0
+            
+            while start_idx < num_tokens:
+                end_idx = min(start_idx + self.n_local, num_tokens)
+                chunk_features = video_features[:, start_idx:end_idx, :]
+                
+                output = self.language_model(inputs_embeds=chunk_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
+                self.kv_cache = output.past_key_values
+                
+                logger.debug(f'Processed tokens {start_idx} to {end_idx} ({end_idx - start_idx} tokens)')
+                start_idx = end_idx
+        else:
+            # n_local 이하인 경우 한 번에 처리
+            output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
+            self.kv_cache = output.past_key_values
+        
         self.print_kv_cache_info()
         return
-    
-    def _encode_video_chunk(self, video_chunk):
-        """기존 호환성을 위한 래퍼 함수. encode_video_chunk와 video_prefill_chunk를 순차 호출합니다."""
-        video_features = self.encode_video_chunk(video_chunk)
-        self.video_prefill_chunk(video_features)
-        return
-
-    @torch.inference_mode()
-    def encode_video(self, video, encode_chunk_size=8):  # video: (Nv, H, W, 3)
-        """비디오를 청크 단위로 인코딩하여 video features 리스트를 반환합니다.
-        
-        Args:
-            video: 비디오 프레임들 (Nv, H, W, 3)
-            encode_chunk_size: 청크 크기
-            
-        Returns:
-            video_features_list: 각 청크의 video features 리스트
-        """
-        return super().encode_video(video, encode_chunk_size)
     
     @torch.inference_mode()
     def video_prefill(self, video_features_list):
@@ -162,9 +166,9 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         super().video_prefill(video_features_list)
     
     @torch.inference_mode()
-    def encode_and_prefill_video(self, video, encode_chunk_size=8):  # video: (Nv, H, W, 3)
+    def encode_and_prefill_video(self, video, encode_chunk_size=8, use_pipeline=False):  # video: (Nv, H, W, 3)
         """기존 호환성을 위한 래퍼 함수. encode_video와 video_prefill을 순차 호출합니다."""
-        super().encode_and_prefill_video(video, encode_chunk_size)
+        super().encode_and_prefill_video(video, encode_chunk_size, use_pipeline)
 
     @torch.inference_mode()
     def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):

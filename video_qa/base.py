@@ -62,7 +62,8 @@ class BaseVQA:
     def __init__(self, anno, save_dir, sample_fps,
                  qa_model, qa_processor=None,
                  num_chunks=None, chunk_idx=None,
-                 retrieve_size=64, chunk_size=1) -> None:
+                 retrieve_size=64, chunk_size=1,
+                 encode_prefill_pipelining=False) -> None:
         
         self.sample_fps = sample_fps
 
@@ -73,6 +74,7 @@ class BaseVQA:
         assert chunk_size <= retrieve_size, f'chunk_size: {chunk_size}, retrieve_size: {retrieve_size}'
         self.retrieve_size = retrieve_size
         self.chunk_size = chunk_size
+        self.encode_prefill_pipelining = encode_prefill_pipelining
 
         self.num_chunks = num_chunks
         self.chunk_idx = chunk_idx
@@ -195,6 +197,7 @@ def work(QA_CLASS):
     parser.add_argument("--n_local", type=int, default=15000)
     parser.add_argument("--retrieve_size", type=int, default=64)
     parser.add_argument("--retrieve_chunk_size", type=int, default=1)
+    parser.add_argument("--encode_prefill_pipelining", type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True)
     args = parser.parse_args()
 
@@ -239,6 +242,7 @@ def work(QA_CLASS):
         num_chunks=args.num_chunks,
         chunk_idx=args.chunk_idx,
         save_dir=args.save_dir,
+        encode_prefill_pipelining=args.encode_prefill_pipelining,
     )
 
     retrieve_analyzer.analyze(debug=args.debug)

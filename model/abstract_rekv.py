@@ -1,4 +1,6 @@
 import torch
+import threading
+import queue
 from logzero import logger
 
 
@@ -41,7 +43,8 @@ class Abstract_ReKV:
         """
         pixel_values_videos = self.processor.video_processor(video_chunk, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
         video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*196, D)
-        assert self.n_local >= video_features.shape[1], f'n_local: {self.n_local}, video_features: {video_features.shape[1]}'
+        if self.n_local < video_features.shape[1]:
+            logger.warning(f'n_local ({self.n_local}) is smaller than video_features tokens ({video_features.shape[1]}). Video will be truncated during prefill.')
         return video_features
     
     def video_prefill_chunk(self, video_features):
@@ -50,27 +53,54 @@ class Abstract_ReKV:
         Args:
             video_features: 인코딩된 비디오 features (1, Nv*196, D)
         """
-        output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
-        self.kv_cache = output.past_key_values
+        num_tokens = video_features.shape[1]
+        
+        # n_local보다 큰 경우 n_local 크기만큼 반복해서 모든 토큰 처리
+        if num_tokens > self.n_local:
+            logger.debug(f'video_features has {num_tokens} tokens, processing in chunks of {self.n_local}')
+            start_idx = 0
+            
+            while start_idx < num_tokens:
+                end_idx = min(start_idx + self.n_local, num_tokens)
+                chunk_features = video_features[:, start_idx:end_idx, :]
+                
+                output = self.language_model(inputs_embeds=chunk_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
+                self.kv_cache = output.past_key_values
+                
+                logger.debug(f'Processed tokens {start_idx} to {end_idx} ({end_idx - start_idx} tokens)')
+                start_idx = end_idx
+        else:
+            # n_local 이하인 경우 한 번에 처리
+            output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
+            self.kv_cache = output.past_key_values
+        
         return
     
-    def _encode_video_chunk(self, video_chunk):
+    def _encode_and_prefill_video_chunk(self, video_chunk):
         """기존 호환성을 위한 래퍼 함수. encode_video_chunk와 video_prefill_chunk를 순차 호출합니다."""
         video_features = self.encode_video_chunk(video_chunk)
         self.video_prefill_chunk(video_features)
         return
 
     @torch.inference_mode()
-    def encode_video(self, video, encode_chunk_size=64):  # video: (Nv, H, W, 3)
+    def encode_and_prefill_video(self, video, encode_chunk_size=64, use_pipeline=False):  # video: (Nv, H, W, 3)
         """비디오를 청크 단위로 인코딩하여 video features 리스트를 반환합니다.
         
         Args:
             video: 비디오 프레임들 (Nv, H, W, 3)
             encode_chunk_size: 청크 크기
+            use_pipeline: 파이프라인 모드 사용 여부 (encoding과 prefill을 병렬 처리)
             
         Returns:
             video_features_list: 각 청크의 video features 리스트
         """
+        if use_pipeline:
+            return self._encode_and_prefill_video_pipeline(video, encode_chunk_size)
+        else:
+            return self._encode_and_prefill_video_sequential(video, encode_chunk_size)
+    
+    def _encode_and_prefill_video_sequential(self, video, encode_chunk_size):
+        """Sequential 방식: encoding과 prefill을 순차적으로 처리합니다."""
         video_features_list = []
         num_frames = video.shape[0]
         num_chunks = num_frames // encode_chunk_size
@@ -79,7 +109,7 @@ class Abstract_ReKV:
             start_idx = chunk_idx * encode_chunk_size
             end_idx = start_idx + encode_chunk_size
             chunk_video = video[start_idx:end_idx]
-            video_features = self.encode_video_chunk(chunk_video)
+            video_features = self._encode_and_prefill_video_chunk(chunk_video)
             video_features_list.append(video_features)
 
         # Handle remaining frames
@@ -88,32 +118,128 @@ class Abstract_ReKV:
             start_idx = num_chunks * encode_chunk_size
             end_idx = start_idx + remaining_frames
             remaining_video = video[start_idx:end_idx]
-            video_features = self.encode_video_chunk(remaining_video)
+            video_features = self._encode_and_prefill_video_chunk(remaining_video)
             video_features_list.append(video_features)
         
         return video_features_list
     
-    @torch.inference_mode()
-    def video_prefill(self, video_features_list):
-        """Video features 리스트를 language_model에 넣어서 KV cache를 업데이트합니다.
+    def _encode_and_prefill_video_pipeline(self, video, encode_chunk_size):
+        """Pipeline 방식: encoding과 prefill을 병렬로 처리합니다.
         
-        Args:
-            video_features_list: 각 청크의 video features 리스트
+        - chunk n이 prefill되고 있을 때 chunk n+1이 encoding 됨
+        - queue의 최대 크기는 2
+        - semaphore를 사용해서 queue가 가득 차면 encoding이 대기
         """
-        for video_features in video_features_list:
-            self.video_prefill_chunk(video_features)
-            logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.3f} GB')
+        num_frames = video.shape[0]
+        num_chunks = num_frames // encode_chunk_size
+        has_remaining = (num_frames % encode_chunk_size) > 0
+        total_chunks = num_chunks + (1 if has_remaining else 0)
         
-        logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.1f} GB')
-    
-    @torch.inference_mode()
-    def encode_and_prefill_video(self, video, encode_chunk_size=64):  # video: (Nv, H, W, 3)
-        """기존 호환성을 위한 래퍼 함수. encode_video와 video_prefill을 순차 호출합니다.
+        # Queue for passing encoded features from encoding thread to prefill thread
+        # Max size 2: allows encoding to be 2 chunks ahead of prefill
+        feature_queue = queue.Queue(maxsize=2)
         
-        기존 코드와의 호환성을 위해 이 함수를 사용하거나, encode_video와 video_prefill을 분리하여 사용할 수 있습니다.
-        """
-        video_features_list = self.encode_video(video, encode_chunk_size)
-        self.video_prefill(video_features_list)
+        # Semaphore to limit queue size (2 slots available)
+        queue_semaphore = threading.Semaphore(2)
+        
+        # Event to signal completion
+        encoding_done = threading.Event()
+        prefill_done = threading.Event()
+        exception_occurred = threading.Event()
+        exception_info = [None]
+        
+        video_features_list = []
+        
+        def encoding_worker():
+            """Encoding thread: encodes video chunks and puts them in the queue."""
+            try:
+                # Process regular chunks
+                for chunk_idx in range(num_chunks):
+                    # Wait for queue slot to be available (semaphore)
+                    queue_semaphore.acquire()
+                    
+                    start_idx = chunk_idx * encode_chunk_size
+                    end_idx = start_idx + encode_chunk_size
+                    chunk_video = video[start_idx:end_idx]
+                    
+                    # Encode chunk
+                    video_features = self.encode_video_chunk(chunk_video)
+                    
+                    # Put in queue (this will block if queue is full, but semaphore prevents this)
+                    feature_queue.put((chunk_idx, video_features))
+                    logger.debug(f'Encoded chunk {chunk_idx}, queue size: {feature_queue.qsize()}')
+                
+                # Handle remaining frames
+                if has_remaining:
+                    queue_semaphore.acquire()
+                    start_idx = num_chunks * encode_chunk_size
+                    end_idx = start_idx + (num_frames % encode_chunk_size)
+                    remaining_video = video[start_idx:end_idx]
+                    video_features = self.encode_video_chunk(remaining_video)
+                    feature_queue.put((num_chunks, video_features))
+                    logger.debug(f'Encoded remaining chunk, queue size: {feature_queue.qsize()}')
+                
+                encoding_done.set()
+                logger.debug('Encoding thread finished')
+                
+            except Exception as e:
+                logger.error(f'Encoding thread error: {e}', exc_info=True)
+                exception_info[0] = e
+                exception_occurred.set()
+                encoding_done.set()
+        
+        def prefill_worker():
+            """Prefill thread: takes encoded features from queue and performs prefill."""
+            try:
+                processed_chunks = 0
+                results = {}
+                
+                while processed_chunks < total_chunks:
+                    # Get encoded features from queue (blocks until available)
+                    # No timeout - wait indefinitely until item is available or encoding is done
+                    chunk_idx, video_features = feature_queue.get()
+                    
+                    # Perform prefill
+                    self.video_prefill_chunk(video_features)
+                    
+                    # Store result
+                    results[chunk_idx] = video_features
+                    processed_chunks += 1
+                    
+                    # Release semaphore slot
+                    queue_semaphore.release()
+                    
+                    logger.debug(f'Prefilled chunk {chunk_idx}, processed: {processed_chunks}/{total_chunks}')
+                
+                # Sort results by chunk index
+                for idx in sorted(results.keys()):
+                    video_features_list.append(results[idx])
+                
+                prefill_done.set()
+                logger.debug('Prefill thread finished')
+                
+            except Exception as e:
+                logger.error(f'Prefill thread error: {e}', exc_info=True)
+                exception_info[0] = e
+                exception_occurred.set()
+                prefill_done.set()
+        
+        # Start threads
+        encoding_thread = threading.Thread(target=encoding_worker, daemon=True)
+        prefill_thread = threading.Thread(target=prefill_worker, daemon=True)
+        
+        encoding_thread.start()
+        prefill_thread.start()
+        
+        # Wait for both threads to complete
+        encoding_thread.join()
+        prefill_thread.join()
+        
+        # Check for exceptions
+        if exception_occurred.is_set():
+            raise RuntimeError(f"Exception in pipeline threads: {exception_info[0]}") from exception_info[0]
+        
+        return video_features_list
 
     @torch.inference_mode()
     def question_answering(self, input_text, max_new_tokens=128):

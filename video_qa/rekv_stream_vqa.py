@@ -37,7 +37,7 @@ class ReKVStreamVQA(BaseVQA):
                 fps = round(vr.get_avg_fps())
                 step = max(1, int(fps / self.sample_fps))
                 # frame_idx = [i for i in range(0, len(vr), step)]
-                frame_idx = np.linspace(0, 60, 200).tolist()
+                frame_idx = np.linspace(0, 60, 256).tolist()
                 video = vr.get_batch(frame_idx).asnumpy()
                 np.save(cache_path, video)
         return video
@@ -74,17 +74,23 @@ class ReKVStreamVQA(BaseVQA):
             # encode video until receiving QA
             if temporal_windows[-1] > video_end_idx:
                 video_end_idx = temporal_windows[-1]
-                self.qa_model.encode_and_prefill_video(video_tensor[int(video_start_idx):int(video_end_idx)])
+                self.qa_model.encode_and_prefill_video(
+                    video_tensor[int(video_start_idx):int(video_end_idx)], 
+                    encode_chunk_size=self.chunk_size,
+                    use_pipeline=self.encode_prefill_pipelining
+                )
                 video_start_idx = video_end_idx
         
-            # OpenQA
-            qa_results = self.video_open_qa(question, max_new_tokens=256)
-            self.record[(self.retrieve_size, self.chunk_size)].append({
-                'video_id': video_sample['video_id'],
-                'question': question,
-                'answer': answer,
-                'pred_answer': qa_results['pred_answer'],
-            })
+            return
+
+            # # OpenQA
+            # qa_results = self.video_open_qa(question, max_new_tokens=256)
+            # self.record[(self.retrieve_size, self.chunk_size)].append({
+            #     'video_id': video_sample['video_id'],
+            #     'question': question,
+            #     'answer': answer,
+            #     'pred_answer': qa_results['pred_answer'],
+            # })
  
 
 if __name__ == "__main__":
