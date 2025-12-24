@@ -3,6 +3,21 @@ import threading
 import queue
 from logzero import logger
 
+# NVTX for nsys profiling
+try:
+    import torch.cuda.nvtx as nvtx
+    NVTX_AVAILABLE = True
+except ImportError:
+    NVTX_AVAILABLE = False
+    # Create dummy context manager if NVTX is not available
+    class nvtx:
+        @staticmethod
+        def range_push(msg):
+            pass
+        @staticmethod
+        def range_pop():
+            pass
+
 
 class Abstract_ReKV:
     processor = None
@@ -41,11 +56,15 @@ class Abstract_ReKV:
         Returns:
             video_features: 인코딩된 비디오 features (1, Nv*196, D)
         """
-        pixel_values_videos = self.processor.video_processor(video_chunk, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
-        video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*196, D)
-        if self.n_local < video_features.shape[1]:
-            logger.warning(f'n_local ({self.n_local}) is smaller than video_features tokens ({video_features.shape[1]}). Video will be truncated during prefill.')
-        return video_features
+        if NVTX_AVAILABLE:
+            nvtx.range_push("encode_video_chunk")
+        try:
+            pixel_values_videos = self.processor.video_processor(video_chunk, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
+            video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*196, D)
+            return video_features
+        finally:
+            if NVTX_AVAILABLE:
+                nvtx.range_pop()
     
     def video_prefill_chunk(self, video_features):
         """Video features를 language_model에 넣어서 KV cache를 업데이트합니다.
@@ -53,26 +72,31 @@ class Abstract_ReKV:
         Args:
             video_features: 인코딩된 비디오 features (1, Nv*196, D)
         """
-        num_tokens = video_features.shape[1]
-        
-        # n_local보다 큰 경우 n_local 크기만큼 반복해서 모든 토큰 처리
-        if num_tokens > self.n_local:
-            logger.debug(f'video_features has {num_tokens} tokens, processing in chunks of {self.n_local}')
-            start_idx = 0
+        if NVTX_AVAILABLE:
+            # 파란색으로 표시 (범위 이름에 색상 정보 포함)
+            nvtx.range_push("video_prefill_chunk [BLUE]")
+        try:
+            num_tokens = video_features.shape[1]
             
-            while start_idx < num_tokens:
-                end_idx = min(start_idx + self.n_local, num_tokens)
-                chunk_features = video_features[:, start_idx:end_idx, :]
+            # n_local보다 큰 경우 n_local 크기만큼 반복해서 모든 토큰 처리
+            if num_tokens > self.n_local:
+                start_idx = 0
                 
-                output = self.language_model(inputs_embeds=chunk_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
+                while start_idx < num_tokens:
+                    end_idx = min(start_idx + self.n_local, num_tokens)
+                    chunk_features = video_features[:, start_idx:end_idx, :]
+                    
+                    output = self.language_model(inputs_embeds=chunk_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
+                    self.kv_cache = output.past_key_values
+                    
+                    start_idx = end_idx
+            else:
+                # n_local 이하인 경우 한 번에 처리
+                output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
                 self.kv_cache = output.past_key_values
-                
-                logger.debug(f'Processed tokens {start_idx} to {end_idx} ({end_idx - start_idx} tokens)')
-                start_idx = end_idx
-        else:
-            # n_local 이하인 경우 한 번에 처리
-            output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
-            self.kv_cache = output.past_key_values
+        finally:
+            if NVTX_AVAILABLE:
+                nvtx.range_pop()
         
         return
     
@@ -167,7 +191,6 @@ class Abstract_ReKV:
                     
                     # Put in queue (this will block if queue is full, but semaphore prevents this)
                     feature_queue.put((chunk_idx, video_features))
-                    logger.debug(f'Encoded chunk {chunk_idx}, queue size: {feature_queue.qsize()}')
                 
                 # Handle remaining frames
                 if has_remaining:
@@ -177,13 +200,12 @@ class Abstract_ReKV:
                     remaining_video = video[start_idx:end_idx]
                     video_features = self.encode_video_chunk(remaining_video)
                     feature_queue.put((num_chunks, video_features))
-                    logger.debug(f'Encoded remaining chunk, queue size: {feature_queue.qsize()}')
-                
+                    
                 encoding_done.set()
-                logger.debug('Encoding thread finished')
+                
                 
             except Exception as e:
-                logger.error(f'Encoding thread error: {e}', exc_info=True)
+                
                 exception_info[0] = e
                 exception_occurred.set()
                 encoding_done.set()
@@ -209,17 +231,15 @@ class Abstract_ReKV:
                     # Release semaphore slot
                     queue_semaphore.release()
                     
-                    logger.debug(f'Prefilled chunk {chunk_idx}, processed: {processed_chunks}/{total_chunks}')
                 
                 # Sort results by chunk index
                 for idx in sorted(results.keys()):
                     video_features_list.append(results[idx])
                 
                 prefill_done.set()
-                logger.debug('Prefill thread finished')
+                
                 
             except Exception as e:
-                logger.error(f'Prefill thread error: {e}', exc_info=True)
                 exception_info[0] = e
                 exception_occurred.set()
                 prefill_done.set()
