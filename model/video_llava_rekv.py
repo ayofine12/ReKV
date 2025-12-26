@@ -112,7 +112,7 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         
         # GPU 분산 처리를 위한 설정
         self.use_multi_gpu_encoding = False
-        self.enable_multi_gpu_encoding = True  # GPU 분산 인코딩 활성화 여부 (수동 설정 가능)
+        # self.enable_multi_gpu_encoding = True  # GPU 분산 인코딩 활성화 여부 (수동 설정 가능)
         self.video_tower_gpu0 = None
         self.video_tower_gpu1 = None
         self.multi_modal_projector_gpu0 = None
@@ -122,7 +122,7 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
             self.device_0 = torch.device("cuda:0")
             self.device_1 = torch.device("cuda:1")
             self.use_multi_gpu_encoding = True
-            logger.info(f"Multi-GPU encoding available: GPU 0 and GPU 1 available (enabled: {self.enable_multi_gpu_encoding})")
+            logger.info(f"Multi-GPU encoding available: GPU 0 and GPU 1 available")
     
     def clear_cache(self):
         """KV cache를 정리하고 GPU 메모리를 비웁니다."""
@@ -227,7 +227,7 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         return video_features
     
     @torch.inference_mode()
-    def encode_video_chunk(self, video_chunk):
+    def encode_video_chunk(self, video_chunk, enable_multi_gpu_encoding):
         """비디오 청크를 인코딩하여 video features를 추출합니다.
         
         Args:
@@ -248,7 +248,7 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
             # vectorized_gather_kernel 인덱스 오류가 발생할 수 있습니다.
             # self.enable_multi_gpu_encoding을 True로 설정하여 활성화할 수 있습니다.
             
-            if self.enable_multi_gpu_encoding and self.chunk_size > 16 and self.use_multi_gpu_encoding and num_frames > 1:
+            if enable_multi_gpu_encoding and self.chunk_size > 16 and self.use_multi_gpu_encoding and num_frames > 1:
                 result = self._encode_video_chunk_multi_gpu(video_chunk)
             else:
                 # 단일 GPU 처리 (GPU 0에서만 실행)

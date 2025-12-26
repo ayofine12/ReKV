@@ -63,7 +63,7 @@ class BaseVQA:
                  qa_model, qa_processor=None,
                  num_chunks=None, chunk_idx=None,
                  retrieve_size=64, chunk_size=1,
-                 encode_prefill_pipelining=False) -> None:
+                 encode_prefill_pipelining=False,) -> None:
         
         self.sample_fps = sample_fps
 

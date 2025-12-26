@@ -1,6 +1,7 @@
 import torch
 import threading
 import queue
+import time
 from logzero import logger
 
 # NVTX for nsys profiling
@@ -47,7 +48,7 @@ class Abstract_ReKV:
     def _get_video_features(self, pixel_values_videos):
         pass
 
-    def encode_video_chunk(self, video_chunk):
+    def encode_video_chunk(self, video_chunk, enable_multi_gpu_encoding):
         """비디오 청크를 인코딩하여 video features를 추출합니다.
         
         Args:
@@ -101,10 +102,14 @@ class Abstract_ReKV:
         return
     
     def _encode_and_prefill_video_chunk(self, video_chunk):
-        """기존 호환성을 위한 래퍼 함수. encode_video_chunk와 video_prefill_chunk를 순차 호출합니다."""
+        """기존 호환성을 위한 래퍼 함수. encode_video_chunk와 video_prefill_chunk를 순차 호출합니다.
+        
+        Returns:
+            video_features: 인코딩된 비디오 features
+        """
         video_features = self.encode_video_chunk(video_chunk)
         self.video_prefill_chunk(video_features)
-        return
+        return video_features
 
     @torch.inference_mode()
     def encode_and_prefill_video(self, video, encode_chunk_size=64, use_pipeline=False):  # video: (Nv, H, W, 3)
@@ -126,6 +131,8 @@ class Abstract_ReKV:
     def _encode_and_prefill_video_sequential(self, video, encode_chunk_size):
         """Sequential 방식: encoding과 prefill을 순차적으로 처리합니다."""
         video_features_list = []
+        encoding_times = []  # 각 chunk의 encoding 시간 저장
+        prefill_times = []   # 각 chunk의 prefill 시간 저장
         num_frames = video.shape[0]
         num_chunks = num_frames // encode_chunk_size
 
@@ -133,7 +140,44 @@ class Abstract_ReKV:
             start_idx = chunk_idx * encode_chunk_size
             end_idx = start_idx + encode_chunk_size
             chunk_video = video[start_idx:end_idx]
-            video_features = self._encode_and_prefill_video_chunk(chunk_video)
+            
+            # Encoding 시간 측정
+            if torch.cuda.is_available():
+                encode_start = torch.cuda.Event(enable_timing=True)
+                encode_end = torch.cuda.Event(enable_timing=True)
+                encode_start.record()
+            else:
+                encode_start_time = time.time()
+            
+            video_features = self.encode_video_chunk(chunk_video)
+            
+            if torch.cuda.is_available():
+                encode_end.record()
+                torch.cuda.synchronize()
+                encoding_time = encode_start.elapsed_time(encode_end) / 1000.0  # ms to seconds
+            else:
+                encoding_time = time.time() - encode_start_time
+            
+            encoding_times.append(encoding_time)
+            
+            # Prefill 시간 측정
+            if torch.cuda.is_available():
+                prefill_start = torch.cuda.Event(enable_timing=True)
+                prefill_end = torch.cuda.Event(enable_timing=True)
+                prefill_start.record()
+            else:
+                prefill_start_time = time.time()
+            
+            self.video_prefill_chunk(video_features)
+            
+            if torch.cuda.is_available():
+                prefill_end.record()
+                torch.cuda.synchronize()
+                prefill_time = prefill_start.elapsed_time(prefill_end) / 1000.0  # ms to seconds
+            else:
+                prefill_time = time.time() - prefill_start_time
+            
+            prefill_times.append(prefill_time)
             video_features_list.append(video_features)
 
         # Handle remaining frames
@@ -142,8 +186,49 @@ class Abstract_ReKV:
             start_idx = num_chunks * encode_chunk_size
             end_idx = start_idx + remaining_frames
             remaining_video = video[start_idx:end_idx]
-            video_features = self._encode_and_prefill_video_chunk(remaining_video)
+            
+            # Encoding 시간 측정
+            if torch.cuda.is_available():
+                encode_start = torch.cuda.Event(enable_timing=True)
+                encode_end = torch.cuda.Event(enable_timing=True)
+                encode_start.record()
+            else:
+                encode_start_time = time.time()
+            
+            video_features = self.encode_video_chunk(remaining_video)
+            
+            if torch.cuda.is_available():
+                encode_end.record()
+                torch.cuda.synchronize()
+                encoding_time = encode_start.elapsed_time(encode_end) / 1000.0  # ms to seconds
+            else:
+                encoding_time = time.time() - encode_start_time
+            
+            encoding_times.append(encoding_time)
+            
+            # Prefill 시간 측정
+            if torch.cuda.is_available():
+                prefill_start = torch.cuda.Event(enable_timing=True)
+                prefill_end = torch.cuda.Event(enable_timing=True)
+                prefill_start.record()
+            else:
+                prefill_start_time = time.time()
+            
+            self.video_prefill_chunk(video_features)
+            
+            if torch.cuda.is_available():
+                prefill_end.record()
+                torch.cuda.synchronize()
+                prefill_time = prefill_start.elapsed_time(prefill_end) / 1000.0  # ms to seconds
+            else:
+                prefill_time = time.time() - prefill_start_time
+            
+            prefill_times.append(prefill_time)
             video_features_list.append(video_features)
+        
+        # 통계 계산 및 로깅
+        self._log_chunk_timing_stats("Sequential", "Encoding", encoding_times)
+        self._log_chunk_timing_stats("Sequential", "Prefill", prefill_times)
         
         return video_features_list
     
@@ -173,6 +258,10 @@ class Abstract_ReKV:
         exception_info = [None]
         
         video_features_list = []
+        encoding_times = []  # 각 chunk의 encoding 시간 저장
+        prefill_times = []   # 각 chunk의 prefill 시간 저장
+        encoding_times_lock = threading.Lock()  # thread-safe 리스트 접근
+        prefill_times_lock = threading.Lock()   # thread-safe 리스트 접근
         
         def encoding_worker():
             """Encoding thread: encodes video chunks and puts them in the queue."""
@@ -182,6 +271,14 @@ class Abstract_ReKV:
                     # Wait for queue slot to be available (semaphore)
                     queue_semaphore.acquire()
                     
+                    # Encoding 시간 측정 시작
+                    if torch.cuda.is_available():
+                        encode_start = torch.cuda.Event(enable_timing=True)
+                        encode_end = torch.cuda.Event(enable_timing=True)
+                        encode_start.record()
+                    else:
+                        encode_start_time = time.time()
+                    
                     start_idx = chunk_idx * encode_chunk_size
                     end_idx = start_idx + encode_chunk_size
                     chunk_video = video[start_idx:end_idx]
@@ -189,16 +286,50 @@ class Abstract_ReKV:
                     # Encode chunk
                     video_features = self.encode_video_chunk(chunk_video)
                     
+                    # Encoding 시간 측정 종료
+                    if torch.cuda.is_available():
+                        encode_end.record()
+                        torch.cuda.synchronize()
+                        encoding_time = encode_start.elapsed_time(encode_end) / 1000.0  # ms to seconds
+                    else:
+                        encoding_time = time.time() - encode_start_time
+                    
+                    # Encoding 시간 저장 (thread-safe)
+                    with encoding_times_lock:
+                        encoding_times.append(encoding_time)
+                    
                     # Put in queue (this will block if queue is full, but semaphore prevents this)
                     feature_queue.put((chunk_idx, video_features))
                 
                 # Handle remaining frames
                 if has_remaining:
                     queue_semaphore.acquire()
+                    
+                    # Encoding 시간 측정 시작
+                    if torch.cuda.is_available():
+                        encode_start = torch.cuda.Event(enable_timing=True)
+                        encode_end = torch.cuda.Event(enable_timing=True)
+                        encode_start.record()
+                    else:
+                        encode_start_time = time.time()
+                    
                     start_idx = num_chunks * encode_chunk_size
                     end_idx = start_idx + (num_frames % encode_chunk_size)
                     remaining_video = video[start_idx:end_idx]
                     video_features = self.encode_video_chunk(remaining_video)
+                    
+                    # Encoding 시간 측정 종료
+                    if torch.cuda.is_available():
+                        encode_end.record()
+                        torch.cuda.synchronize()
+                        encoding_time = encode_start.elapsed_time(encode_end) / 1000.0  # ms to seconds
+                    else:
+                        encoding_time = time.time() - encode_start_time
+                    
+                    # Encoding 시간 저장 (thread-safe)
+                    with encoding_times_lock:
+                        encoding_times.append(encoding_time)
+                    
                     feature_queue.put((num_chunks, video_features))
                     
                 encoding_done.set()
@@ -221,8 +352,28 @@ class Abstract_ReKV:
                     # No timeout - wait indefinitely until item is available or encoding is done
                     chunk_idx, video_features = feature_queue.get()
                     
+                    # Prefill 시간 측정 시작
+                    if torch.cuda.is_available():
+                        prefill_start = torch.cuda.Event(enable_timing=True)
+                        prefill_end = torch.cuda.Event(enable_timing=True)
+                        prefill_start.record()
+                    else:
+                        prefill_start_time = time.time()
+                    
                     # Perform prefill
                     self.video_prefill_chunk(video_features)
+                    
+                    # Prefill 시간 측정 종료
+                    if torch.cuda.is_available():
+                        prefill_end.record()
+                        torch.cuda.synchronize()
+                        prefill_time = prefill_start.elapsed_time(prefill_end) / 1000.0  # ms to seconds
+                    else:
+                        prefill_time = time.time() - prefill_start_time
+                    
+                    # Prefill 시간 저장 (thread-safe)
+                    with prefill_times_lock:
+                        prefill_times.append(prefill_time)
                     
                     # Store result
                     results[chunk_idx] = video_features
@@ -259,6 +410,10 @@ class Abstract_ReKV:
         if exception_occurred.is_set():
             raise RuntimeError(f"Exception in pipeline threads: {exception_info[0]}") from exception_info[0]
         
+        # 통계 계산 및 로깅
+        self._log_chunk_timing_stats("Pipeline", "Encoding", encoding_times)
+        self._log_chunk_timing_stats("Pipeline", "Prefill", prefill_times)
+        
         return video_features_list
 
     @torch.inference_mode()
@@ -269,3 +424,35 @@ class Abstract_ReKV:
         n_layers = len(self.kv_cache)
         memory = n_layers * self.kv_cache[0].calculate_cpu_memory()
         return memory
+    
+    def _log_chunk_timing_stats(self, mode, phase, chunk_times):
+        """각 chunk 처리 시간의 통계를 계산하고 로깅합니다.
+        
+        Args:
+            mode: 모드 이름 ("Sequential" 또는 "Pipeline")
+            phase: 단계 이름 ("Encoding" 또는 "Prefill")
+            chunk_times: 각 chunk 처리 시간 리스트 (초 단위)
+        """
+        if not chunk_times:
+            logger.warning(f"[{mode}] [{phase}] No chunk timing data available")
+            return
+        
+        import numpy as np
+        
+        chunk_times_array = np.array(chunk_times)
+        min_time = np.min(chunk_times_array)
+        max_time = np.max(chunk_times_array)
+        mean_time = np.mean(chunk_times_array)
+        median_time = np.median(chunk_times_array)
+        std_time = np.std(chunk_times_array)
+        total_time = np.sum(chunk_times_array)
+        
+        logger.info(f"[{mode}] [{phase}] Chunk Timing Statistics:")
+        logger.info(f"  Total chunks: {len(chunk_times)}")
+        logger.info(f"  Min time: {min_time:.4f}s (chunk {np.argmin(chunk_times_array)})")
+        logger.info(f"  Max time: {max_time:.4f}s (chunk {np.argmax(chunk_times_array)})")
+        logger.info(f"  Mean time: {mean_time:.4f}s")
+        logger.info(f"  Median time: {median_time:.4f}s")
+        logger.info(f"  Std dev: {std_time:.4f}s")
+        logger.info(f"  Total time: {total_time:.4f}s")
+        logger.info(f"  Individual chunk times: {[f'{t:.4f}' for t in chunk_times]}")
