@@ -1,4 +1,5 @@
 import torch
+import time
 from transformers import VideoLlavaProcessor, VideoLlavaForConditionalGeneration
 from logzero import logger
 
@@ -118,8 +119,26 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         Returns:
             video_features: 인코딩된 비디오 features (1, Nv*256, D)
         """
+        # 시간 측정 시작
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.time()
+        
         pixel_values_videos = self.processor.video_processor(images=None, videos=video_chunk, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
         video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*256, D)
+        
+        # GPU 연산 완료 대기 후 시간 측정 종료
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed_time = time.time() - start_time
+        
+        # 시간을 리스트에 추가 (encode_and_prefill_video 실행 중인 경우)
+        if hasattr(self, '_collecting_times') and self._collecting_times:
+            with self._times_lock:
+                self.encode_times.append(elapsed_time)
+        
+        logger.info(f'[encode_video_chunk] Execution time: {elapsed_time:.4f} seconds')
+        
         if self.n_local < video_features.shape[1]:
             logger.warning(f'n_local ({self.n_local}) is smaller than video_features tokens ({video_features.shape[1]}). Video will be truncated during prefill.')
         logger.debug(f'video_features: {video_features.shape[1]}')
@@ -132,6 +151,11 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         Args:
             video_features: 인코딩된 비디오 features (1, Nv*256, D)
         """
+        # 시간 측정 시작
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.time()
+        
         num_tokens = video_features.shape[1]
         
         # n_local보다 큰 경우 n_local 크기만큼 반복해서 모든 토큰 처리
@@ -152,6 +176,18 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
             # n_local 이하인 경우 한 번에 처리
             output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
             self.kv_cache = output.past_key_values
+        
+        # GPU 연산 완료 대기 후 시간 측정 종료
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed_time = time.time() - start_time
+        
+        # 시간을 리스트에 추가 (encode_and_prefill_video 실행 중인 경우)
+        if hasattr(self, '_collecting_times') and self._collecting_times:
+            with self._times_lock:
+                self.prefill_times.append(elapsed_time)
+        
+        logger.info(f'[video_prefill_chunk] Execution time: {elapsed_time:.4f} seconds (num_tokens: {num_tokens})')
         
         self.print_kv_cache_info()
         return

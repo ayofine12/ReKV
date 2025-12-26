@@ -1,6 +1,7 @@
 import torch
 import threading
 import queue
+import time
 from logzero import logger
 
 
@@ -15,6 +16,9 @@ class Abstract_ReKV:
         self.n_local = n_local
         self.topk = topk
         self.chunk_size = chunk_size
+        self.encode_times = []
+        self.prefill_times = []
+        self._times_lock = threading.Lock()
 
     def clear_cache(self):
         self.kv_cache = None
@@ -94,10 +98,57 @@ class Abstract_ReKV:
         Returns:
             video_features_list: 각 청크의 video features 리스트
         """
-        if use_pipeline:
-            return self._encode_and_prefill_video_pipeline(video, encode_chunk_size)
-        else:
-            return self._encode_and_prefill_video_sequential(video, encode_chunk_size)
+        # 시간 수집 시작
+        self._collecting_times = True
+        self.encode_times = []
+        self.prefill_times = []
+        
+        try:
+            if use_pipeline:
+                result = self._encode_and_prefill_video_pipeline(video, encode_chunk_size)
+            else:
+                result = self._encode_and_prefill_video_sequential(video, encode_chunk_size)
+            
+            # 시간 통계 출력
+            self._print_timing_stats()
+            
+            return result
+        finally:
+            # 시간 수집 종료
+            self._collecting_times = False
+    
+    def _print_timing_stats(self):
+        """시간 통계를 출력합니다."""
+        if not self.encode_times and not self.prefill_times:
+            return
+        
+        print("\n" + "="*60)
+        print("Video Encoding and Prefill Timing Statistics")
+        print("="*60)
+        
+        if self.encode_times:
+            print(f"\n[encode_video_chunk] Times (seconds):")
+            for i, t in enumerate(self.encode_times):
+                print(f"  Chunk {i}: {t:.4f}")
+            print(f"  Total: {sum(self.encode_times):.4f}")
+            print(f"  Average: {sum(self.encode_times)/len(self.encode_times):.4f}")
+            print(f"  Min: {min(self.encode_times):.4f}")
+            print(f"  Max: {max(self.encode_times):.4f}")
+        
+        if self.prefill_times:
+            print(f"\n[video_prefill_chunk] Times (seconds):")
+            for i, t in enumerate(self.prefill_times):
+                print(f"  Chunk {i}: {t:.4f}")
+            print(f"  Total: {sum(self.prefill_times):.4f}")
+            print(f"  Average: {sum(self.prefill_times)/len(self.prefill_times):.4f}")
+            print(f"  Min: {min(self.prefill_times):.4f}")
+            print(f"  Max: {max(self.prefill_times):.4f}")
+        
+        if self.encode_times and self.prefill_times:
+            total_time = sum(self.encode_times) + sum(self.prefill_times)
+            print(f"\n[Total] Combined time: {total_time:.4f} seconds")
+        
+        print("="*60 + "\n")
     
     def _encode_and_prefill_video_sequential(self, video, encode_chunk_size):
         """Sequential 방식: encoding과 prefill을 순차적으로 처리합니다."""
