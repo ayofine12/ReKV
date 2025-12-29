@@ -1,6 +1,8 @@
 import copy
+import pickle
 import torch
 from typing import Optional
+from pathlib import Path
 
 from .kv_cache_manager import ContextManager
 from .dot_production_attention import get_multi_stage_dot_production_attention
@@ -60,6 +62,12 @@ def rekv_attention_forward(
 
         local_q, local_k, local_v = h_q, h_k, h_v
         global_q, global_k, global_v = h_q, h_k, h_v
+
+        # # Save position_bias to pickle
+        # save_path = Path("./position_bias.pkl")
+        # save_path.parent.mkdir(parents=True, exist_ok=True)
+        # with open(save_path, 'wb') as f:
+        #     pickle.dump(position_bias, f)
 
         # NOTE: Question-answering, fall back to sliding-window attention (infinite_lm)
         if type(past_key_value) is not ContextManager or past_key_value.to_retrieve:

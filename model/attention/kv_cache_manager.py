@@ -667,7 +667,10 @@ class ContextManager:
             o_list.append(chunk_o)
 
             # offload context memory
-            with torch.cuda.stream(GLOBAL_STREAM):
+            if self.async_global_stream:
+                with torch.cuda.stream(GLOBAL_STREAM):
+                    self._append_global()
+            else:
                 self._append_global()
 
             if self.async_global_stream:
