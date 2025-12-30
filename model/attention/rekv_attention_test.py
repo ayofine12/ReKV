@@ -164,12 +164,15 @@ def __main__():
         # Stage 1: Transfer input tensors as soon as append starts
         transfer_gpu0_to_gpu1_ready.wait()
         
+        with torch.cuda.device(1):
+            with torch.cuda.stream(gpu1_transfer_stream):
+                transfer_gpu0_to_gpu1_start.record(stream=gpu1_transfer_stream)
+                
         if ENABLE_OVERLAP:
             print("Stage 1: Transferring input tensors (local_k_gpu0, local_v_gpu0) to GPU 1 [OVERLAP ENABLED]...")
             with torch.cuda.device(1):
                 with torch.cuda.stream(gpu1_transfer_stream):
-                    transfer_gpu0_to_gpu1_start.record(stream=gpu1_transfer_stream)
-                    torch.cuda.nvtx.range_push("GPU0_to_GPU1_KV_Cache_Transfer")
+                    torch.cuda.nvtx.range_push("GPU0_to_GPU1_Stage1_Transfer")
                     
                     # Transfer input tensors local_k_gpu0 and local_v_gpu0 to GPU1
                     # Concatenate with existing local_k and local_v
@@ -187,10 +190,6 @@ def __main__():
                     torch.cuda.nvtx.range_pop()
         else:
             print("Stage 1: SKIPPED [OVERLAP DISABLED - avoiding PCIe contention]")
-            with torch.cuda.device(1):
-                with torch.cuda.stream(gpu1_transfer_stream):
-                    transfer_gpu0_to_gpu1_start.record(stream=gpu1_transfer_stream)
-                    # Stage 1 disabled - will transfer everything in Stage 2
         
         # Stage 2: Wait for GPU0 append to complete, then transfer all updated states
         gpu0_append_complete.wait()
@@ -261,14 +260,17 @@ def __main__():
         # Stage 1: Transfer input tensors as soon as GPU1 append starts
         transfer_gpu1_to_gpu2_ready.wait()
         
+        with torch.cuda.device(2):
+            with torch.cuda.stream(gpu2_transfer_stream):
+                transfer_gpu1_to_gpu2_start.record(stream=gpu2_transfer_stream)
+                
         if ENABLE_OVERLAP:
-            print("Stage 1: Transferring input tensors (local_k_gpu0, local_v_gpu0) to GPU 2 [OVERLAP ENABLED]...")
+            print("Stage 1: Transferring input tensors (local_k_gpu1, local_v_gpu1) to GPU 2 [OVERLAP ENABLED]...")
             with torch.cuda.device(2):
                 with torch.cuda.stream(gpu2_transfer_stream):
-                    transfer_gpu1_to_gpu2_start.record(stream=gpu2_transfer_stream)
-                    torch.cuda.nvtx.range_push("GPU1_to_GPU2_KV_Cache_Transfer")
+                    torch.cuda.nvtx.range_push("GPU1_to_GPU2_Stage1_Transfer")
                     
-                    # Transfer input tensors local_k_gpu0 and local_v_gpu0 to GPU2
+                    # Transfer input tensors local_k_gpu1 and local_v_gpu1 to GPU2
                     # Concatenate with existing local_k and local_v
                     local_k_gpu2_new = local_k_gpu1.to("cuda:2", non_blocking=True)
                     local_v_gpu2_new = local_v_gpu1.to("cuda:2", non_blocking=True)
@@ -284,10 +286,6 @@ def __main__():
                     torch.cuda.nvtx.range_pop()
         else:
             print("Stage 1: SKIPPED [OVERLAP DISABLED - avoiding PCIe contention]")
-            with torch.cuda.device(2):
-                with torch.cuda.stream(gpu2_transfer_stream):
-                    transfer_gpu1_to_gpu2_start.record(stream=gpu2_transfer_stream)
-                    # Stage 1 disabled - will transfer everything in Stage 2
         
         # Stage 2: Wait for GPU1 append to complete, then transfer all updated states
         gpu1_append_complete.wait()
@@ -303,8 +301,8 @@ def __main__():
                 
                 # Transfer input tensors local_k_gpu0 and local_v_gpu0 to GPU2 if not done in Stage 1
                 if not ENABLE_OVERLAP:
-                    local_k_gpu2_new = local_k_gpu0.to("cuda:2", non_blocking=True)
-                    local_v_gpu2_new = local_v_gpu0.to("cuda:2", non_blocking=True)
+                    local_k_gpu2_new = local_k_gpu1.to("cuda:2", non_blocking=True)
+                    local_v_gpu2_new = local_v_gpu1.to("cuda:2", non_blocking=True)
                     
                     past_key_value_gpu2.local_k = torch.cat((past_key_value_gpu2.local_k, local_k_gpu2_new), dim=-2)
                     past_key_value_gpu2.local_v = torch.cat((past_key_value_gpu2.local_v, local_v_gpu2_new), dim=-2)
