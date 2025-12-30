@@ -183,9 +183,6 @@ class VectorTensor:
         return self.length
 
 
-GLOBAL_STREAM = None
-
-
 class ContextManager:
     def __init__(self, 
                  position_embedding,
@@ -212,9 +209,12 @@ class ContextManager:
         self.load_count = 0
         self.async_global_stream = async_global_stream
         self.pin_memory = pin_memory
-        global GLOBAL_STREAM
-        if self.async_global_stream and GLOBAL_STREAM is None:
-            GLOBAL_STREAM = torch.cuda.Stream()
+        
+        # Create a separate stream for each ContextManager instance
+        if self.async_global_stream:
+            self.global_stream = torch.cuda.Stream()
+        else:
+            self.global_stream = None
 
         self.reset_retrieval()
 
@@ -355,7 +355,7 @@ class ContextManager:
         global_h_k = self.global_buffer[0]
         global_h_v = self.global_buffer[1]
 
-        with torch.cuda.stream(GLOBAL_STREAM):
+        with torch.cuda.stream(self.global_stream):
             if self.init_exc:  # init KV were loaded in global_h_k, context KV were offloaded in global_blocks
                 # offload LRU blocks
                 for u in range(self.num_units):
@@ -412,7 +412,7 @@ class ContextManager:
             # assert global_h_k.size(-2) == global_h_v.size(-2) == self.n_init + block_num * self.block_size
 
         if self.async_global_stream:
-            torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
+            torch.cuda.current_stream().wait_stream(self.global_stream)
 
         assert global_h_k.size(-2) <= self.n_init + self.n_local
         return global_h_k, global_h_v 
@@ -530,6 +530,7 @@ class ContextManager:
         Returns:
             chunk_o: (batch_size, num_heads, length, dim_head)
         """
+        torch.cuda.nvtx.range_push("_append")
 
         # apply RoPE to input QKV
         local_h_q, local_h_k = self.position_embedding(local_q, local_k)
@@ -543,12 +544,12 @@ class ContextManager:
         )
 
         # load init KV
-        with torch.cuda.stream(GLOBAL_STREAM):
+        with torch.cuda.stream(self.global_stream):
             global_h_q = global_q
             global_h_k, global_h_v = self.get_global_hidden_and_mask(exc_length=global_q.size(-2))
 
         if self.async_global_stream:
-            torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
+            torch.cuda.current_stream().wait_stream(self.global_stream)
 
         # input Q attends to init KV
         attn.append(
@@ -562,8 +563,9 @@ class ContextManager:
         o, _ = attn.get_result()
 
         if self.async_global_stream:
-            GLOBAL_STREAM.wait_stream(torch.cuda.current_stream())
+            self.global_stream.wait_stream(torch.cuda.current_stream())
 
+        torch.cuda.nvtx.range_pop()
         return o.view((self.batch_size, self.num_heads, -1, self.dim_head))
 
     def _append_global(
@@ -571,6 +573,7 @@ class ContextManager:
     ):
         """offload context memory
         """
+        torch.cuda.nvtx.range_push("_append_global")
 
         global_remainder_ed = self._global_remainder_ed
         global_remainder_st = self._global_remainder_st
@@ -612,6 +615,8 @@ class ContextManager:
 
         self._global_remainder_ed = global_remainder_ed
         self._global_remainder_st = global_remainder_st
+        
+        torch.cuda.nvtx.range_pop()
 
     def append(
         self,
@@ -628,7 +633,7 @@ class ContextManager:
         input_length = local_q.size(-2)
         
         if self.async_global_stream:
-            GLOBAL_STREAM.wait_stream(torch.cuda.current_stream())
+            self.global_stream.wait_stream(torch.cuda.current_stream())
 
         # append local KV
         self.local_k = torch.cat((self.local_k, local_k), dim=-2)
@@ -636,7 +641,7 @@ class ContextManager:
         kv_length = self.local_k.size(-2)
 
         # append global remainder
-        with torch.cuda.stream(GLOBAL_STREAM):
+        with torch.cuda.stream(self.global_stream):
             self._global_remainder_st = 0
             self._global_remainder_ed = self.global_remainder[0].size(-2)
 
@@ -646,10 +651,12 @@ class ContextManager:
             )
 
         # apply RoPE to global_q
-        with torch.cuda.stream(GLOBAL_STREAM):
+        torch.cuda.nvtx.range_push("apply RoPE to global_q")
+        with torch.cuda.stream(self.global_stream):
             global_q = self.position_embedding.apply_rotary_pos_emb_one_angle(
                 global_q, self.n_local
             )
+        torch.cuda.nvtx.range_pop()
 
         o_list = []
         for st in range(0, input_length, self.exc_block_size):  # Process the input tokens in blocks.
@@ -668,13 +675,13 @@ class ContextManager:
 
             # offload context memory
             if self.async_global_stream:
-                with torch.cuda.stream(GLOBAL_STREAM):
+                with torch.cuda.stream(self.global_stream):
                     self._append_global()
             else:
                 self._append_global()
 
             if self.async_global_stream:
-                torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
+                torch.cuda.current_stream().wait_stream(self.global_stream)
 
         self.length += input_length
 
@@ -686,7 +693,7 @@ class ContextManager:
         # update global remainder
         assert self._global_remainder_ed == self.global_remainder[0].size(-2)
         assert not self.init_exc or self._global_remainder_st == self._global_remainder_ed, f'self.init_exc: {self.init_exc}, global_remainder_st: {self._global_remainder_st}, global_remainder_ed: {self._global_remainder_ed}'
-        with torch.cuda.stream(GLOBAL_STREAM):
+        with torch.cuda.stream(self.global_stream):
             self.global_remainder = (
                 self.global_remainder[0][:, :, self._global_remainder_st:, :],
                 self.global_remainder[1][:, :, self._global_remainder_st:, :]
