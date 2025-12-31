@@ -26,6 +26,17 @@ def rekv_attention_forward(
                     dim_head, num_heads, num_heads_kv,
     ):
 
+        # """ Save project_q, project_k, project_v to pickle """
+        # save_dir = Path("./pickled_projections")
+        # save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # with open(save_dir / "project_q.pkl", 'wb') as f:
+        #     pickle.dump(project_q, f)
+        # with open(save_dir / "project_k.pkl", 'wb') as f:
+        #     pickle.dump(project_k, f)
+        # with open(save_dir / "project_v.pkl", 'wb') as f:
+        #     pickle.dump(project_v, f)
+
         """ 1. Project QKV """
         batch_size = query.size(0)
         len_q = query.size(1)

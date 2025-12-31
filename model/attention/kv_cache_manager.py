@@ -252,32 +252,96 @@ class ContextManager:
         tensor = tensor.expand((self.num_units, self.unit_size_kv, num_group, length, dim_head)).reshape((self.num_units, self.num_heads, length, dim_head))  # (batch_size, n_head, length, dim_head)
         return tensor
     
+    # def init(
+    #     self, 
+    #     local_q, local_k, local_v,
+    #     global_q, global_k, global_v
+    # ):
+    #     """
+    #     Only use the metadata of these parameters, such as shape, dtype, and device.
+    #     """
+    #     assert local_q.dim() == 4
+    #     batch_size, num_heads, len_q, dim_head = local_q.shape
+    #     num_heads_kv = local_k.size(1)
+
+    #     for _t in [local_q, local_k, local_v, global_q, global_k, global_v]:
+    #         assert _t.size(0) == batch_size
+    #         assert (_t.size(1) == num_heads or _t.size(1) == num_heads_kv)
+    #         assert _t.size(2) == len_q
+    #         assert _t.size(3) == dim_head
+    #         assert _t.is_cuda
+
+    #     self.batch_size = batch_size
+    #     self.num_heads = num_heads
+    #     self.num_heads_kv = num_heads_kv
+    #     self.dim_head = dim_head
+    #     self.num_units = batch_size
+    #     self.unit_size = num_heads
+    #     self.unit_size_kv = num_heads_kv
+
+    #     self.global_blocks = [[] for _ in range(self.num_units)] # context memory's KV-Cache: [ batch_size x [memory_unit] ]
+    #     self.cached_blocks = [{} for _ in range(self.num_units)] # relavency scores of blocks: batch_size x {block_id: block_score}
+    #     self.num_global_block = 0
+
+    #     # context memory's representative keys: batch_size x (n_blocks, hidden_dim)
+    #     self.block_k = [VectorTensor(
+    #         dim_head * self.unit_size, global_k.dtype, global_k.device
+    #     ) for _ in range(self.num_units)]
+
+    #     # local KV
+    #     self.local_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_k.dtype, device=local_k.device)  # (batch_size, n_head_kv, 0, dim_head)
+    #     self.local_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_v.dtype, device=local_v.device)
+
+    #     # global KV that are not yet processed into blocks.
+    #     # 2 x (batch_size, n_head_kv, length, dim_head)
+    #     self.global_remainder = (
+    #         torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device),
+    #         torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_v.dtype, device=global_v.device),
+    #     )
+
+    #     # init KV
+    #     self.init_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device)
+    #     self.init_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device)
+    #     self.init_exc = False
+    #     self.dtype = local_q.dtype
+    #     self.position_embedding._update_cos_sin_tables_len(
+    #         self.n_local + self.exc_block_size + 1, local_k.device, local_k.dim()
+    #     )
+
+    #     # buffering global KV during attention computations
+    #     # (2, batch_size, n_head_kv, L, dim_head)
+    #     # L = n_init + n_retrieve
+    #     buffer_len = self.topk * self.block_size + self.n_init
+    #     self.global_buffer = torch.zeros(
+    #             (2, self.num_units, self.unit_size_kv, buffer_len , dim_head),
+    #             dtype = global_k.dtype, device=global_k.device
+    #         )
+    #     self.global_buffer_init_st = 0
+    #     self.global_buffer_init_ed = 0
+    #     self.cuda_cache = CudaCache(
+    #         self.max_cached_block * self.num_units,
+    #         self.unit_size_kv * self.block_size * dim_head * 2,
+    #         local_k.dtype
+    #     )  # (max_cached_block * batch_size, block_size * D * 2)
+
+    #     self.initialized = True
+
     def init(
-        self, 
-        local_q, local_k, local_v,
-        global_q, global_k, global_v
+        self,
+        batch_size, 
+        num_heads, 
+        dim_head,
+        tensor_dim,
+        dtype,
+        device,
     ):
-        """
-        Only use the metadata of these parameters, such as shape, dtype, and device.
-        """
-        assert local_q.dim() == 4
-        batch_size, num_heads, len_q, dim_head = local_q.shape
-        num_heads_kv = local_k.size(1)
-
-        for _t in [local_q, local_k, local_v, global_q, global_k, global_v]:
-            assert _t.size(0) == batch_size
-            assert (_t.size(1) == num_heads or _t.size(1) == num_heads_kv)
-            assert _t.size(2) == len_q
-            assert _t.size(3) == dim_head
-            assert _t.is_cuda
-
         self.batch_size = batch_size
         self.num_heads = num_heads
-        self.num_heads_kv = num_heads_kv
+        self.num_heads_kv = num_heads
         self.dim_head = dim_head
         self.num_units = batch_size
         self.unit_size = num_heads
-        self.unit_size_kv = num_heads_kv
+        self.unit_size_kv = num_heads
 
         self.global_blocks = [[] for _ in range(self.num_units)] # context memory's KV-Cache: [ batch_size x [memory_unit] ]
         self.cached_blocks = [{} for _ in range(self.num_units)] # relavency scores of blocks: batch_size x {block_id: block_score}
@@ -285,27 +349,27 @@ class ContextManager:
 
         # context memory's representative keys: batch_size x (n_blocks, hidden_dim)
         self.block_k = [VectorTensor(
-            dim_head * self.unit_size, global_k.dtype, global_k.device
+            dim_head * self.unit_size, dtype, device
         ) for _ in range(self.num_units)]
 
         # local KV
-        self.local_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_k.dtype, device=local_k.device)  # (batch_size, n_head_kv, 0, dim_head)
-        self.local_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_v.dtype, device=local_v.device)
+        self.local_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=dtype, device=device)  # (batch_size, n_head_kv, 0, dim_head)
+        self.local_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=dtype, device=device)
 
         # global KV that are not yet processed into blocks.
         # 2 x (batch_size, n_head_kv, length, dim_head)
         self.global_remainder = (
-            torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device),
-            torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_v.dtype, device=global_v.device),
+            torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=dtype, device=device),
+            torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=dtype, device=device),
         )
 
         # init KV
-        self.init_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device)
-        self.init_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device)
+        self.init_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=dtype, device=device)
+        self.init_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=dtype, device=device)
         self.init_exc = False
-        self.dtype = local_q.dtype
+        self.dtype = dtype
         self.position_embedding._update_cos_sin_tables_len(
-            self.n_local + self.exc_block_size + 1, local_k.device, local_k.dim()
+            self.n_local + self.exc_block_size + 1, device, tensor_dim
         )
 
         # buffering global KV during attention computations
@@ -314,14 +378,14 @@ class ContextManager:
         buffer_len = self.topk * self.block_size + self.n_init
         self.global_buffer = torch.zeros(
                 (2, self.num_units, self.unit_size_kv, buffer_len , dim_head),
-                dtype = global_k.dtype, device=global_k.device
+                dtype = dtype, device=device
             )
         self.global_buffer_init_st = 0
         self.global_buffer_init_ed = 0
         self.cuda_cache = CudaCache(
             self.max_cached_block * self.num_units,
             self.unit_size_kv * self.block_size * dim_head * 2,
-            local_k.dtype
+            dtype
         )  # (max_cached_block * batch_size, block_size * D * 2)
 
         self.initialized = True
@@ -532,9 +596,11 @@ class ContextManager:
         """
         torch.cuda.nvtx.range_push("_append")
 
+        torch.cuda.nvtx.range_push("position_embedding")
         # apply RoPE to input QKV
         local_h_q, local_h_k = self.position_embedding(local_q, local_k)
         local_h_v = local_v
+        torch.cuda.nvtx.range_pop()
 
         # input Q attends to input + local KV
         attn = self.Attn(local_h_q.shape, local_h_q.dtype, local_h_q.device)
