@@ -1,6 +1,4 @@
 import torch
-import threading
-import os
 
 from .kv_cache_manager import ContextManager
 from .position_bias_utils import load_position_bias
@@ -24,6 +22,12 @@ dim_head = 128
 tensor_dim = 4
 
 def transfer_src_to_dest(past_key_value_gpu_src, past_key_value_gpu_dest, dest_device):
+    transfer_start = torch.cuda.Event(enable_timing=True)
+    transfer_end = torch.cuda.Event(enable_timing=True)
+
+    torch.cuda.synchronize()
+    transfer_start.record()
+
     # Copy global remainder (updated during append)
     past_key_value_gpu_dest.global_remainder = (
         past_key_value_gpu_src.global_remainder[0].to(dest_device, non_blocking=True),
@@ -54,10 +58,15 @@ def transfer_src_to_dest(past_key_value_gpu_src, past_key_value_gpu_dest, dest_d
             gpu1_data = gpu0_data.to("cuda:1", non_blocking=True)
             past_key_value_gpu_dest.block_k[u].append(gpu1_data)  # Append all at once
 
+    torch.cuda.synchronize()
+    transfer_end.record()
+    transfer_time_ms = transfer_start.elapsed_time(transfer_end)
+    print(f"Transfer time: {transfer_time_ms:.3f} ms")
+
 def make_query(batch_size, len_q, num_heads, dim_head, device):
     return torch.randn(batch_size, len_q, num_heads * dim_head, dtype=torch.float16, device=device)
 
-def attention(len_q = 4096, past_key_value=None, current_query=None, prev_query=None, device="cuda:0"):
+def attention(current_len_q = 4096, prev_len_q = 4096, past_key_value=None, current_query=None, prev_query=None, device="cuda:0"):
     projection_start = torch.cuda.Event(enable_timing=True)
     projection_end = torch.cuda.Event(enable_timing=True)
     append_start = torch.cuda.Event(enable_timing=True)
@@ -74,18 +83,18 @@ def attention(len_q = 4096, past_key_value=None, current_query=None, prev_query=
         current_h_q = project_q(current_query)
         current_h_k = project_k(current_query)
         current_h_v = project_v(current_query)
-        current_h_q = current_h_q.view(batch_size, len_q, num_heads, dim_head).permute(0, 2, 1, 3).contiguous()      # (batch, num_heads, len_q, dim_head)
-        current_h_k = current_h_k.view(batch_size, len_q, num_heads, dim_head).permute(0, 2, 1, 3).contiguous()      # (batch, num_heads, len_q, dim_head)
-        current_h_v = current_h_v.view(batch_size, len_q, num_heads, dim_head).permute(0, 2, 1, 3).contiguous()      # (batch, num_heads, len_q, dim_head)
+        current_h_q = current_h_q.view(batch_size, current_len_q, num_heads, dim_head).permute(0, 2, 1, 3).contiguous()      # (batch, num_heads, len_q, dim_head)
+        current_h_k = current_h_k.view(batch_size, current_len_q, num_heads, dim_head).permute(0, 2, 1, 3).contiguous()      # (batch, num_heads, len_q, dim_head)
+        current_h_v = current_h_v.view(batch_size, current_len_q, num_heads, dim_head).permute(0, 2, 1, 3).contiguous()      # (batch, num_heads, len_q, dim_head)
         current_local_q, current_local_k, current_local_v = current_h_q, current_h_k, current_h_v
         current_global_q, current_global_k, current_global_v = current_h_q, current_h_k, current_h_v
     if prev_query is not None:
         prev_h_q = project_q(prev_query)
         prev_h_k = project_k(prev_query)
         prev_h_v = project_v(prev_query)
-        prev_h_q = prev_h_q.view(batch_size, len_q, num_heads, dim_head).permute(0, 2, 1, 3).contiguous()          # (batch, num_heads, len_q, dim_head)
-        prev_h_k = prev_h_k.view(batch_size, len_q, num_heads, dim_head).permute(0, 2, 1, 3).contiguous()          # (batch, num_heads, len_q, dim_head)
-        prev_h_v = prev_h_v.view(batch_size, len_q, num_heads, dim_head).permute(0, 2, 1, 3).contiguous()          # (batch, num_heads, len_q, dim_head)
+        prev_h_q = prev_h_q.view(batch_size, prev_len_q, num_heads, dim_head).permute(0, 2, 1, 3).contiguous()          # (batch, num_heads, len_q, dim_head)
+        prev_h_k = prev_h_k.view(batch_size, prev_len_q, num_heads, dim_head).permute(0, 2, 1, 3).contiguous()          # (batch, num_heads, len_q, dim_head)
+        prev_h_v = prev_h_v.view(batch_size, prev_len_q, num_heads, dim_head).permute(0, 2, 1, 3).contiguous()          # (batch, num_heads, len_q, dim_head)
         prev_local_q, prev_local_k, prev_local_v = prev_h_q, prev_h_k, prev_h_v
         prev_global_q, prev_global_k, prev_global_v = prev_h_q, prev_h_k, prev_h_v    
 
@@ -159,19 +168,20 @@ def __main__():
     past_key_value_gpu2.init(batch_size, num_heads, dim_head, tensor_dim, torch.float16, "cuda:2")
 
     query0_gpu0 = make_query(batch_size, n_init+len_q, num_heads, dim_head, "cuda:0")
-    query0_gpu1 = make_query(batch_size, len_q, num_heads, dim_head, "cuda:1")
+    query1_gpu0 = make_query(batch_size, len_q, num_heads, dim_head, "cuda:0")
     query1_gpu1 = make_query(batch_size, len_q, num_heads, dim_head, "cuda:1")
-    query1_gpu2 = make_query(batch_size, len_q, num_heads, dim_head, "cuda:2")
+    query2_gpu1 = make_query(batch_size, len_q, num_heads, dim_head, "cuda:1")
     query2_gpu2 = make_query(batch_size, len_q, num_heads, dim_head, "cuda:2")
+    query3_gpu2 = make_query(batch_size, len_q, num_heads, dim_head, "cuda:2")
 
     
-    past_key_value_gpu0 = attention(n_init+len_q, past_key_value_gpu0, query0_gpu0, None, "cuda:0")
+    past_key_value_gpu0 = attention(len_q, n_init+len_q, past_key_value_gpu0, query1_gpu0, query0_gpu0, "cuda:0")
     transfer_src_to_dest(past_key_value_gpu0, past_key_value_gpu1, "cuda:1")
 
-    past_key_value_gpu1 = attention(len_q, past_key_value_gpu1, query0_gpu1, query1_gpu1, "cuda:1")
+    past_key_value_gpu1 = attention(len_q, len_q, past_key_value_gpu1, query1_gpu1, query2_gpu1, "cuda:1")
     transfer_src_to_dest(past_key_value_gpu1, past_key_value_gpu2, "cuda:2")
 
-    past_key_value_gpu2 = attention(len_q, past_key_value_gpu2, query1_gpu2, query2_gpu2, "cuda:2")
+    past_key_value_gpu2 = attention(len_q, len_q, past_key_value_gpu2, query2_gpu2, query3_gpu2, "cuda:2")
     
 if __name__ == "__main__":
     __main__()

@@ -1,187 +1,6 @@
-import math
 import torch
-from typing import Optional, Tuple
 
 from .dot_production_attention import get_multi_stage_dot_production_attention
-
-
-# Allocate a fixed-size block of GPU memory specifically for storing the KV-Cache of the local_window.
-class CudaCache:
-    def __init__(self, num_units, unit_size, dtype):
-        self.num_units = num_units  # n_block
-        self.unit_size = unit_size  # block_size * hidden_dim * 2
-        self.dtype = dtype
-        self.data = torch.empty(
-            (num_units, unit_size),
-            device = "cuda",
-            dtype=dtype
-        )
-        self.idle_set = set(list(range(num_units)))
-
-    def alloc(self):
-        assert len(self.idle_set) > 0
-        idx = self.idle_set.pop()
-        return self.data[idx], idx
-
-    def delete(self, idx):
-        assert idx not in self.idle_set
-        self.idle_set.add(idx)
-
-
-# The KV-Cache management unit supports data transfer between the CPU and GPU.
-class MemoryUnit:
-    # Initialize the KV-Cache management unit and store it on the CPU.
-    def __init__(
-        self, 
-        kv: Tuple[torch.Tensor, torch.Tensor], 
-        cache: CudaCache, 
-        load_to_cache: bool = False, 
-        pin_memory: bool = False,
-    ):
-        self.cache = cache
-
-        if kv[0].is_cuda:
-            cpu_data = tuple(_t.contiguous().to("cpu", non_blocking=True) for _t in kv)
-        else:
-            cpu_data = tuple(_t.contiguous() for _t in kv)
-
-        if pin_memory:
-            cpu_data = tuple(_t.pin_memory() for _t in cpu_data)
-
-        if load_to_cache:
-            gpu_data, gpu_data_id = cache.alloc()
-            gpu_data = gpu_data.view((2,) + kv[0].shape)
-            gpu_data[0].copy_(kv[0], non_blocking=True)
-            gpu_data[1].copy_(kv[1], non_blocking=True)
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream())
-        else:
-            gpu_data, gpu_data_id = None, None
-            event = None
-
-        self.cpu_data = cpu_data
-        self.gpu_data = gpu_data
-        self.gpu_data_id = gpu_data_id
-        self.event = event
-
-    # Load data from the CPU to the GPU and copy it to 'target' when necessary.
-    # target: 2x (n_head, n_token, head_dim), on GPU
-    def load(self, target: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> bool:
-        if self.gpu_data is not None:
-            if target is not None:
-                target[0].copy_(self.gpu_data[0], non_blocking=True)
-                target[1].copy_(self.gpu_data[1], non_blocking=True)
-                target_event = torch.cuda.Event()
-                target_event.record(torch.cuda.current_stream())
-            else:
-                target_event = None
-
-            return False, target_event
-
-        gpu_data, gpu_data_id = self.cache.alloc()
-        gpu_data = gpu_data.view((2,) + self.cpu_data[0].shape)
-        if target is not None:
-            target[0].copy_(self.cpu_data[0], non_blocking=True)
-            target[1].copy_(self.cpu_data[1], non_blocking=True)
-            target_event = torch.cuda.Event()
-            target_event.record(torch.cuda.current_stream())
-            gpu_data[0].copy_(target[0], non_blocking=True)
-            gpu_data[1].copy_(target[1], non_blocking=True)
-
-        else:
-            gpu_data[0].copy_(self.cpu_data[0], non_blocking=True)
-            gpu_data[1].copy_(self.cpu_data[1], non_blocking=True)
-
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream())
-        self.event = event
-        self.gpu_data = gpu_data
-        self.gpu_data_id = gpu_data_id
-
-        return True, target_event
-
-    # Get the KV-Cache stored on GPU
-    def get(self):
-        assert self.gpu_data is not None
-        self.event.wait()
-        return self.gpu_data
-
-    # Clear the KV-Cache stored on GPU
-    def offload(self):
-        assert self.gpu_data is not None
-        self.event.wait()
-        self.gpu_data = None
-        self.cache.delete(self.gpu_data_id)
-        self.gpu_data_id = None
-
-    def calculate_cpu_memory(self):
-        return len(self.cpu_data) * self.cpu_data[0].numel() * self.cpu_data[0].element_size()
-
-
-# A dynamically growing vector cache on the GPU, used to store representative vectors of video frames.
-class VectorTensor:
-    # Initialize an empty cache of size (16, hidden_dim) on the GPU.
-    def __init__(
-        self, 
-        hidden_size,
-        element_dtype,
-        device
-    ):
-        init_cached_size = 16
-        self.data = torch.empty(
-            (init_cached_size, hidden_size),
-            dtype=element_dtype,
-            device=device
-        )
-        self.length = 0
-        self.cache_size = init_cached_size
-        self.hidden_size = hidden_size
-
-    # Double the size of the cache.
-    def append_cache(self):
-        new_cache_size = self.cache_size * 2
-        data_shape = self.data.shape
-        new_data = torch.empty(
-            (new_cache_size,) + data_shape[1:],
-            device=self.data.device,
-            dtype=self.data.dtype
-        )
-        new_data[:self.cache_size,...].copy_(self.data)
-        self.data = new_data
-        self.cache_size = new_cache_size
-
-    # Append a frame vector to the cache, and expand the cache if it exceeds the current cache size.
-    def append(self, tensor: torch.Tensor):
-        assert tensor.dtype == self.data.dtype
-        assert tensor.size(1) == self.hidden_size, f'{tensor.size(1)}, {self.hidden_size}'
-        assert tensor.is_contiguous()
-
-        append_l = tensor.size(0)
-
-        while self.length + append_l > self.cache_size:
-            self.append_cache()
-
-        self.data[self.length: self.length+append_l, ...].copy_(tensor)
-
-        self.length += append_l
-
-    # Get the cached frame vectors
-    def get_data(self):
-        return self.data[:self.length, ...]
-
-    def get_cosine_similarity(self, tensor: torch.Tensor):
-        assert tensor.dim() == 1 and tensor.size(0) == self.hidden_size, f'{tensor.size(0)}, {self.hidden_size}'
-        key = self.data[:self.length].float()  # (T, D), convert to fp32 to prevent numerical overflow
-        query = tensor[None, :].float()  # (1, D)
-
-        logits = torch.matmul(query, key.T)[0]  # (T,)
-
-        assert logits.dim() == 1 and logits.size(0) == self.length
-        return logits
-
-    def __len__(self):
-        return self.length
-
 
 class ContextManager:
     def __init__(self, 
@@ -252,32 +71,96 @@ class ContextManager:
         tensor = tensor.expand((self.num_units, self.unit_size_kv, num_group, length, dim_head)).reshape((self.num_units, self.num_heads, length, dim_head))  # (batch_size, n_head, length, dim_head)
         return tensor
     
+    # def init(
+    #     self, 
+    #     local_q, local_k, local_v,
+    #     global_q, global_k, global_v
+    # ):
+    #     """
+    #     Only use the metadata of these parameters, such as shape, dtype, and device.
+    #     """
+    #     assert local_q.dim() == 4
+    #     batch_size, num_heads, len_q, dim_head = local_q.shape
+    #     num_heads_kv = local_k.size(1)
+
+    #     for _t in [local_q, local_k, local_v, global_q, global_k, global_v]:
+    #         assert _t.size(0) == batch_size
+    #         assert (_t.size(1) == num_heads or _t.size(1) == num_heads_kv)
+    #         assert _t.size(2) == len_q
+    #         assert _t.size(3) == dim_head
+    #         assert _t.is_cuda
+
+    #     self.batch_size = batch_size
+    #     self.num_heads = num_heads
+    #     self.num_heads_kv = num_heads_kv
+    #     self.dim_head = dim_head
+    #     self.num_units = batch_size
+    #     self.unit_size = num_heads
+    #     self.unit_size_kv = num_heads_kv
+
+    #     self.global_blocks = [[] for _ in range(self.num_units)] # context memory's KV-Cache: [ batch_size x [memory_unit] ]
+    #     self.cached_blocks = [{} for _ in range(self.num_units)] # relavency scores of blocks: batch_size x {block_id: block_score}
+    #     self.num_global_block = 0
+
+    #     # context memory's representative keys: batch_size x (n_blocks, hidden_dim)
+    #     self.block_k = [VectorTensor(
+    #         dim_head * self.unit_size, global_k.dtype, global_k.device
+    #     ) for _ in range(self.num_units)]
+
+    #     # local KV
+    #     self.local_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_k.dtype, device=local_k.device)  # (batch_size, n_head_kv, 0, dim_head)
+    #     self.local_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_v.dtype, device=local_v.device)
+
+    #     # global KV that are not yet processed into blocks.
+    #     # 2 x (batch_size, n_head_kv, length, dim_head)
+    #     self.global_remainder = (
+    #         torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device),
+    #         torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_v.dtype, device=global_v.device),
+    #     )
+
+    #     # init KV
+    #     self.init_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device)
+    #     self.init_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device)
+    #     self.init_exc = False
+    #     self.dtype = local_q.dtype
+    #     self.position_embedding._update_cos_sin_tables_len(
+    #         self.n_local + self.exc_block_size + 1, local_k.device, local_k.dim()
+    #     )
+
+    #     # buffering global KV during attention computations
+    #     # (2, batch_size, n_head_kv, L, dim_head)
+    #     # L = n_init + n_retrieve
+    #     buffer_len = self.topk * self.block_size + self.n_init
+    #     self.global_buffer = torch.zeros(
+    #             (2, self.num_units, self.unit_size_kv, buffer_len , dim_head),
+    #             dtype = global_k.dtype, device=global_k.device
+    #         )
+    #     self.global_buffer_init_st = 0
+    #     self.global_buffer_init_ed = 0
+    #     self.cuda_cache = CudaCache(
+    #         self.max_cached_block * self.num_units,
+    #         self.unit_size_kv * self.block_size * dim_head * 2,
+    #         local_k.dtype
+    #     )  # (max_cached_block * batch_size, block_size * D * 2)
+
+    #     self.initialized = True
+
     def init(
-        self, 
-        local_q, local_k, local_v,
-        global_q, global_k, global_v
+        self,
+        batch_size, 
+        num_heads, 
+        dim_head,
+        tensor_dim,
+        dtype,
+        device,
     ):
-        """
-        Only use the metadata of these parameters, such as shape, dtype, and device.
-        """
-        assert local_q.dim() == 4
-        batch_size, num_heads, len_q, dim_head = local_q.shape
-        num_heads_kv = local_k.size(1)
-
-        for _t in [local_q, local_k, local_v, global_q, global_k, global_v]:
-            assert _t.size(0) == batch_size
-            assert (_t.size(1) == num_heads or _t.size(1) == num_heads_kv)
-            assert _t.size(2) == len_q
-            assert _t.size(3) == dim_head
-            assert _t.is_cuda
-
         self.batch_size = batch_size
         self.num_heads = num_heads
-        self.num_heads_kv = num_heads_kv
+        self.num_heads_kv = num_heads
         self.dim_head = dim_head
         self.num_units = batch_size
         self.unit_size = num_heads
-        self.unit_size_kv = num_heads_kv
+        self.unit_size_kv = num_heads
 
         self.global_blocks = [[] for _ in range(self.num_units)] # context memory's KV-Cache: [ batch_size x [memory_unit] ]
         self.cached_blocks = [{} for _ in range(self.num_units)] # relavency scores of blocks: batch_size x {block_id: block_score}
@@ -285,27 +168,27 @@ class ContextManager:
 
         # context memory's representative keys: batch_size x (n_blocks, hidden_dim)
         self.block_k = [VectorTensor(
-            dim_head * self.unit_size, global_k.dtype, global_k.device
+            dim_head * self.unit_size, dtype, device
         ) for _ in range(self.num_units)]
 
         # local KV
-        self.local_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_k.dtype, device=local_k.device)  # (batch_size, n_head_kv, 0, dim_head)
-        self.local_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=local_v.dtype, device=local_v.device)
+        self.local_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=dtype, device=device)  # (batch_size, n_head_kv, 0, dim_head)
+        self.local_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=dtype, device=device)
 
         # global KV that are not yet processed into blocks.
         # 2 x (batch_size, n_head_kv, length, dim_head)
         self.global_remainder = (
-            torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device),
-            torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_v.dtype, device=global_v.device),
+            torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=dtype, device=device),
+            torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=dtype, device=device),
         )
 
         # init KV
-        self.init_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device)
-        self.init_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device)
+        self.init_k = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=dtype, device=device)
+        self.init_v = torch.empty((self.num_units, self.unit_size_kv, 0, dim_head), dtype=dtype, device=device)
         self.init_exc = False
-        self.dtype = local_q.dtype
+        self.dtype = dtype
         self.position_embedding._update_cos_sin_tables_len(
-            self.n_local + self.exc_block_size + 1, local_k.device, local_k.dim()
+            self.n_local + self.exc_block_size + 1, device, tensor_dim
         )
 
         # buffering global KV during attention computations
@@ -314,19 +197,17 @@ class ContextManager:
         buffer_len = self.topk * self.block_size + self.n_init
         self.global_buffer = torch.zeros(
                 (2, self.num_units, self.unit_size_kv, buffer_len , dim_head),
-                dtype = global_k.dtype, device=global_k.device
+                dtype = dtype, device=device
             )
         self.global_buffer_init_st = 0
         self.global_buffer_init_ed = 0
         self.cuda_cache = CudaCache(
             self.max_cached_block * self.num_units,
             self.unit_size_kv * self.block_size * dim_head * 2,
-            local_k.dtype
+            dtype
         )  # (max_cached_block * batch_size, block_size * D * 2)
 
         self.initialized = True
-
-
 
     def set_retrieval(self):
         self.to_retrieve = True
@@ -572,67 +453,67 @@ class ContextManager:
         torch.cuda.nvtx.range_pop()
         return o.view((self.batch_size, self.num_heads, -1, self.dim_head))
 
-    def _append_global(
-        self
-    ):
-        """offload context memory
-        """
-        torch.cuda.nvtx.range_push("_append_global")
+#   def _append_global(
+#         self
+#     ):
+#         """offload context memory
+#         """
+#         torch.cuda.nvtx.range_push("_append_global")
 
-        global_remainder_ed = self._global_remainder_ed
-        global_remainder_st = self._global_remainder_st
+#         global_remainder_ed = self._global_remainder_ed
+#         global_remainder_st = self._global_remainder_st
 
-        global_remainder_len = global_remainder_ed - global_remainder_st
+#         global_remainder_len = global_remainder_ed - global_remainder_st
 
-        # offload context KV to CPU
-        if self.init_exc:
-            assert global_remainder_len % self.block_size == 0, f'global_remainder_len: {global_remainder_len}, block_size: {self.block_size}'
-            while global_remainder_len > 0:
-                global_remainder_len -= self.block_size
+#         # offload context KV to CPU
+#         if self.init_exc:
+#             assert global_remainder_len % self.block_size == 0, f'global_remainder_len: {global_remainder_len}, block_size: {self.block_size}'
+#             while global_remainder_len > 0:
+#                 global_remainder_len -= self.block_size
 
-                # Context KV-Cache
-                for u in range(self.num_units):
-                    self.global_blocks[u].append((
-                        MemoryUnit(
-                            (
-                                self.global_remainder[0][u, :, global_remainder_st:global_remainder_st + self.block_size, :],
-                                self.global_remainder[1][u, :, global_remainder_st:global_remainder_st + self.block_size, :]
-                            ),
-                            self.cuda_cache,
-                            False,
-                            self.pin_memory
-                        )
-                    ))
+#                 # Context KV-Cache
+#                 for u in range(self.num_units):
+#                     self.global_blocks[u].append((
+#                         MemoryUnit(
+#                             (
+#                                 self.global_remainder[0][u, :, global_remainder_st:global_remainder_st + self.block_size, :],
+#                                 self.global_remainder[1][u, :, global_remainder_st:global_remainder_st + self.block_size, :]
+#                             ),
+#                             self.cuda_cache,
+#                             False,
+#                             self.pin_memory
+#                         )
+#                     ))
 
-                # NOTE: the average of global_remainder is used as the representative vector.
-                global_block_k = self.global_remainder[0][:, :, global_remainder_st:global_remainder_st + self.block_size, :]
-                global_block_k = self._from_group_kv(global_block_k)  # (batch_size, num_heads, length, dim_head)
+#                 # NOTE: the average of global_remainder is used as the representative vector.
+#                 global_block_k = self.global_remainder[0][:, :, global_remainder_st:global_remainder_st + self.block_size, :]
+#                 global_block_k = self._from_group_kv(global_block_k)  # (batch_size, num_heads, length, dim_head)
 
-                global_block_k = global_block_k.mean(dim=-2, keepdim=False)  # (batch_size, num_heads, dim_head)
-                global_block_k = global_block_k.reshape(self.num_units, -1)  # (batch_size, num_heads * dim_head)
-                global_block_k = global_block_k[:, None, :]  # (batch_size, 1, num_heads * dim_head)
-                for u in range(self.num_units):
-                    self.block_k[u].append(global_block_k[u])
+#                 global_block_k = global_block_k.mean(dim=-2, keepdim=False)  # (batch_size, num_heads, dim_head)
+#                 global_block_k = global_block_k.reshape(self.num_units, -1)  # (batch_size, num_heads * dim_head)
+#                 global_block_k = global_block_k[:, None, :]  # (batch_size, 1, num_heads * dim_head)
+#                 for u in range(self.num_units):
+#                     self.block_k[u].append(global_block_k[u])
                 
-                self.num_global_block += 1
-                global_remainder_st += self.block_size
+#                 self.num_global_block += 1
+#                 global_remainder_st += self.block_size
 
-        self._global_remainder_ed = global_remainder_ed
-        self._global_remainder_st = global_remainder_st
+#         self._global_remainder_ed = global_remainder_ed
+#         self._global_remainder_st = global_remainder_st
         
-        torch.cuda.nvtx.range_pop()
+#         torch.cuda.nvtx.range_pop()  
 
     def append(
         self,
         local_q, local_k, local_v,
         global_q, global_k, global_v,
     ):
-        # Pre-allocate GPU Memory.
-        if not self.initialized:
-            self.init(
-                local_q, local_k, local_v,
-                global_q, global_k, global_v
-            )
+        # # Pre-allocate GPU Memory.
+        # if not self.initialized:
+        #     self.init(
+        #         local_q, local_k, local_v,
+        #         global_q, global_k, global_v
+        #     )
 
         input_length = local_q.size(-2)
         
@@ -644,23 +525,23 @@ class ContextManager:
         self.local_v = torch.cat((self.local_v, local_v), dim=-2)
         kv_length = self.local_k.size(-2)
 
-        # append global remainder
-        with torch.cuda.stream(self.global_stream):
-            self._global_remainder_st = 0
-            self._global_remainder_ed = self.global_remainder[0].size(-2)
+        # # append global remainder
+        # with torch.cuda.stream(self.global_stream):
+        #     self._global_remainder_st = 0
+        #     self._global_remainder_ed = self.global_remainder[0].size(-2)
 
-            self.global_remainder = (
-                torch.cat((self.global_remainder[0], global_k), dim=-2),
-                torch.cat((self.global_remainder[1], global_v), dim=-2),
-            )
+        #     self.global_remainder = (
+        #         torch.cat((self.global_remainder[0], global_k), dim=-2),
+        #         torch.cat((self.global_remainder[1], global_v), dim=-2),
+        #     )
 
-        # apply RoPE to global_q
-        torch.cuda.nvtx.range_push("apply RoPE to global_q")
-        with torch.cuda.stream(self.global_stream):
-            global_q = self.position_embedding.apply_rotary_pos_emb_one_angle(
-                global_q, self.n_local
-            )
-        torch.cuda.nvtx.range_pop()
+        # # apply RoPE to global_q
+        # torch.cuda.nvtx.range_push("apply RoPE to global_q")
+        # with torch.cuda.stream(self.global_stream):
+        #     global_q = self.position_embedding.apply_rotary_pos_emb_one_angle(
+        #         global_q, self.n_local
+        #     )
+        # torch.cuda.nvtx.range_pop()
 
         o_list = []
         for st in range(0, input_length, self.exc_block_size):  # Process the input tokens in blocks.
@@ -677,31 +558,31 @@ class ContextManager:
             )
             o_list.append(chunk_o)
 
-            # offload context memory
-            if self.async_global_stream:
-                with torch.cuda.stream(self.global_stream):
-                    self._append_global()
-            else:
-                self._append_global()
+            # # offload context memory
+            # if self.async_global_stream:
+            #     with torch.cuda.stream(self.global_stream):
+            #         self._append_global()
+            # else:
+            #     self._append_global()
 
             if self.async_global_stream:
                 torch.cuda.current_stream().wait_stream(self.global_stream)
 
         self.length += input_length
 
-        # restrict the length of local KV-cache to self.n_local
-        if self.local_k.size(-2) >= self.n_local:
-            self.local_k = self.local_k[:, :, -self.n_local:, :]
-            self.local_v = self.local_v[:, :, -self.n_local:, :]
+        # # restrict the length of local KV-cache to self.n_local
+        # if self.local_k.size(-2) >= self.n_local:
+        #     self.local_k = self.local_k[:, :, -self.n_local:, :]
+        #     self.local_v = self.local_v[:, :, -self.n_local:, :]
 
-        # update global remainder
-        assert self._global_remainder_ed == self.global_remainder[0].size(-2)
-        assert not self.init_exc or self._global_remainder_st == self._global_remainder_ed, f'self.init_exc: {self.init_exc}, global_remainder_st: {self._global_remainder_st}, global_remainder_ed: {self._global_remainder_ed}'
-        with torch.cuda.stream(self.global_stream):
-            self.global_remainder = (
-                self.global_remainder[0][:, :, self._global_remainder_st:, :],
-                self.global_remainder[1][:, :, self._global_remainder_st:, :]
-            )
+        # # update global remainder
+        # assert self._global_remainder_ed == self.global_remainder[0].size(-2)
+        # assert not self.init_exc or self._global_remainder_st == self._global_remainder_ed, f'self.init_exc: {self.init_exc}, global_remainder_st: {self._global_remainder_st}, global_remainder_ed: {self._global_remainder_ed}'
+        # with torch.cuda.stream(self.global_stream):
+        #     self.global_remainder = (
+        #         self.global_remainder[0][:, :, self._global_remainder_st:, :],
+        #         self.global_remainder[1][:, :, self._global_remainder_st:, :]
+        #     )
 
         ret = torch.cat(o_list, dim=-2)
         
