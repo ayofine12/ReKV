@@ -35,12 +35,20 @@ class Abstract_ReKV:
         video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*196, D)
         assert self.n_local >= video_features.shape[1], f'n_local: {self.n_local}, video_features: {video_features.shape[1]}'
 
+        return video_features
+
+    def _prefill_video_chunk(self, video_features):
         output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
         self.kv_cache = output.past_key_values
         return
 
+    def _encode_and_prefill_video_chunk(self, video_chunk):
+        video_features = self._encode_video_chunk(video_chunk)
+        self._prefill_video_chunk(video_features)
+        return
+
     @torch.inference_mode()
-    def encode_video(self, video, encode_chunk_size=64):  # video: (Nv, H, W, 3)
+    def encode_and_prefill_video(self, video, encode_chunk_size=64):  # video: (Nv, H, W, 3)
         # encode chunk by chunk
         num_frames = video.shape[0]
         num_chunks = num_frames // encode_chunk_size
@@ -49,7 +57,7 @@ class Abstract_ReKV:
             start_idx = chunk_idx * encode_chunk_size
             end_idx = start_idx + encode_chunk_size
             chunk_video = video[start_idx:end_idx]
-            self._encode_video_chunk(chunk_video)
+            self._encode_and_prefill_video_chunk(chunk_video)
             logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.3f} GB')
 
         # Handle remaining frames
