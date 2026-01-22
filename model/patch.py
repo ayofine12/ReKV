@@ -4,7 +4,8 @@ from transformers.models.llama.modeling_llama import LlamaModel
 from transformers.models.mistral.modeling_mistral import MistralModel
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model as Qwen2BaseModel
 
-from model.attention import RotaryEmbeddingESM, rekv_attention_forward
+from model.attention import RotaryEmbeddingESM, EventfulLlamaAttention
+from model.decoder import EventfulLlamaDecoderLayer
 
 
 def huggingface_forward(forward):
@@ -150,63 +151,9 @@ def patch_hf(
             attentions=all_self_attns,
         )
 
-    forward = huggingface_forward(rekv_attention_forward(**attn_kwargs))
+    # forward = huggingface_forward(rekv_attention_forward(**attn_kwargs))
     
-    # Patch LlamaDecoderLayer.forward to handle 3 return values from self_attn
-    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-    from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
-    from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
-    
-    def decoder_layer_forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask = None,
-        position_ids = None,
-        past_key_value = None,  # Support both old and new parameter names
-        use_cache = False,
-        cache_position = None,
-        position_embeddings = None,
-        output_attentions = False,
-        **kwargs,
-    ):
-        
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention - unpack 3 values: (attn_output, attn_weights, past_key_value)
-        hidden_states, _, past_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            output_attentions=output_attentions,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        
-        # Return format to match model_forward expectations:
-        # - output_attentions=False, use_cache=True: (hidden_states, past_key_value)
-        # - output_attentions=True, use_cache=True: (hidden_states, attn_weights, past_key_value)
-        # - use_cache=False: (hidden_states,) or (hidden_states, attn_weights)
-        if use_cache:
-            if output_attentions:
-                return hidden_states, None, past_key_value
-            else:
-                return hidden_states, past_key_value
-        else:
-            if output_attentions:
-                return hidden_states, None
-            else:
-                return hidden_states
-    
+    # Get the appropriate model class and base model
     if isinstance(model, LlamaForCausalLM):
         Attention = model.model.layers[0].self_attn.__class__
         Model = model.model.__class__
@@ -277,16 +224,40 @@ def patch_hf(
         distance_scale
     )
     base_model.position_bias = rope
-
-    def set_forward(m): # m is module object
-        if isinstance(m, Attention):
-            m._old_forward = m.forward
-            m.forward = forward.__get__(m, Attention)
-        elif isinstance(m, (LlamaDecoderLayer, MistralDecoderLayer, Qwen2DecoderLayer)):
-            m._old_forward = m.forward
-            m.forward = decoder_layer_forward.__get__(m, m.__class__)
-
-    model.apply(set_forward)
+    
+    print(f"Replacing {len(base_model.layers)} decoder layers with EventfulLlamaDecoderLayer...")
+    new_layers = []
+    for i, old_layer in enumerate(base_model.layers):
+        # Get device from old layer
+        device = old_layer.self_attn.q_proj.weight.device
+        
+        # Create new EventfulLlamaDecoderLayer
+        new_layer = EventfulLlamaDecoderLayer(config, i)
+        
+        # Move to device BEFORE loading state_dict to ensure all new components are on correct device
+        new_layer = new_layer.to(device)
+        
+        # Copy all weights from old layer to new layer
+        # This includes self_attn, mlp, input_layernorm, post_attention_layernorm
+        new_layer.load_state_dict(old_layer.state_dict(), strict=False)
+        
+        # Now replace the attention layer with EventfulLlamaAttention
+        old_attention = new_layer.self_attn
+        new_attention = EventfulLlamaAttention(config, i, **attn_kwargs)
+        
+        # Move attention to device BEFORE loading state_dict
+        new_attention = new_attention.to(device)
+        
+        # Copy weights from old attention to new attention
+        new_attention.load_state_dict(old_attention.state_dict(), strict=False)
+        
+        # Replace attention in the new layer
+        new_layer.self_attn = new_attention
+        
+        new_layers.append(new_layer)
+    
+    # Replace all layers at once
+    base_model.layers = torch.nn.ModuleList(new_layers)
 
     base_model._old_forward = base_model.forward
     base_model.forward = model_forward.__get__(base_model, Model)

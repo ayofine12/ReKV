@@ -76,6 +76,8 @@ class ReKVStreamVQA(BaseVQA):
                 video_end_idx = temporal_windows[-1]
                 self.qa_model.encode_and_prefill_video(video_tensor[int(video_start_idx):int(video_end_idx)])
                 video_start_idx = video_end_idx
+            
+            break
         
             # # OpenQA
             # qa_results = self.video_open_qa(question, max_new_tokens=256)

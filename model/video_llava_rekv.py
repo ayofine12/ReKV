@@ -103,8 +103,8 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         elif self.config.vision_feature_select_strategy == "full":
             selected_video_feature = selected_video_feature
         
-        video_features = self.multi_modal_projector(selected_video_feature)  # (Nv, 257, D)
-        video_features = video_features.reshape(batch_size, frames * video_features.shape[1], -1)  # (B, Nv*257, D)
+        video_features = self.multi_modal_projector(selected_video_feature)  # (Nv, 256, D)
+        video_features = video_features.reshape(batch_size, frames * video_features.shape[1], -1)  # (B, Nv*256, D)
         return video_features
     
     def _encode_video_chunk(self, video_chunk):

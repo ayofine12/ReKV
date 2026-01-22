@@ -1,4 +1,4 @@
 from .rope import RotaryEmbeddingESM
-from .rekv_attention import rekv_attention_forward
+from .eventful_rekv_attention_layer import EventfulLlamaAttention
 
-__all__ = ["RotaryEmbeddingESM", "rekv_attention_forward"]
+__all__ = ["RotaryEmbeddingESM", "EventfulLlamaAttention"]

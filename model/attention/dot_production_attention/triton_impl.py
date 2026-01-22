@@ -19,8 +19,8 @@ import triton.language as tl
 from .base import MultiStageDotProductionAttention
 
 
-_BLOCK_N=64
-_BLOCK_M=64
+_BLOCK_N=32  # Reduced from 64 to reduce shared memory usage
+_BLOCK_M=32  # Reduced from 64 to reduce shared memory usage
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, 
