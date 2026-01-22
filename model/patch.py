@@ -1,3 +1,4 @@
+import gc
 import torch
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
 from transformers.models.llama.modeling_llama import LlamaModel
@@ -228,43 +229,66 @@ def patch_hf(
     base_model.position_bias = rope
     
     print(f"Replacing {len(base_model.layers)} decoder layers with EventfulLlamaDecoderLayer...")
-    new_layers = []
-    for i, old_layer in enumerate(base_model.layers):
-        # Get device from old layer
+    
+    # Store reference to old layers
+    old_layers = base_model.layers
+    num_layers = len(old_layers)
+    
+    # Create empty ModuleList for new layers
+    base_model.layers = torch.nn.ModuleList()
+    
+    # Replace each layer one by one to minimize memory overhead
+    for i in range(num_layers):
+        old_layer = old_layers[i]
         device = old_layer.self_attn.q_proj.weight.device
         
-        # Create new EventfulLlamaDecoderLayer
-        new_layer = EventfulLlamaDecoderLayer(config, i)
+        # Save references to existing components to reuse them
+        old_attention = old_layer.self_attn
+        old_mlp = old_layer.mlp
+        old_input_layernorm = old_layer.input_layernorm
+        old_post_attention_layernorm = old_layer.post_attention_layernorm
         
-        # Move to device BEFORE loading state_dict to ensure all new components are on correct device
+        # Create new EventfulLlamaDecoderLayer (this will create a new attention in __init__)
+        new_layer = EventfulLlamaDecoderLayer(config, i)
         new_layer = new_layer.to(device)
         
-        # Copy all weights from old layer to new layer
-        # This includes self_attn, mlp, input_layernorm, post_attention_layernorm
-        new_layer.load_state_dict(old_layer.state_dict(), strict=False)
+        # Reuse existing components instead of copying weights (memory efficient!)
+        # This avoids creating duplicate weights in memory
+        new_layer.mlp = old_mlp
+        new_layer.input_layernorm = old_input_layernorm
+        new_layer.post_attention_layernorm = old_post_attention_layernorm
         
-        # Now replace the attention layer with EventfulLlamaAttention
-        old_attention = new_layer.self_attn
+        # Delete the attention that was created by EventfulLlamaDecoderLayer.__init__
+        del new_layer.self_attn
+        
+        # Create new EventfulLlamaAttention
         new_attention = EventfulLlamaAttention(config, i, **attn_kwargs)
-        
-        # Move attention to device BEFORE loading state_dict
         new_attention = new_attention.to(device)
         
         # Copy weights from old attention to new attention
         new_attention.load_state_dict(old_attention.state_dict(), strict=False)
         
-        # Replace attention in the new layer
+        # Assign new attention
         new_layer.self_attn = new_attention
         
-        # Disable gradient computation for inference (memory optimization)
-        # Note: This is in addition to model.eval() and @torch.inference_mode()
-        # to ensure stateful modules (TokenGate, TokenBuffer) don't hold gradient graphs
-        new_layer.requires_grad_(False)
+        # Delete old attention
+        del old_attention
         
-        new_layers.append(new_layer)
+        # Add to new layers
+        base_model.layers.append(new_layer)
+        
+        # Clear old layer from old_layers list
+        old_layers[i] = None
+        del old_layer
+        
+        # Periodic garbage collection
+        if (i + 1) % 8 == 0 or i == num_layers - 1:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     
-    # Replace all layers at once
-    base_model.layers = torch.nn.ModuleList(new_layers)
+    # Delete old layers reference
+    del old_layers
 
     base_model._old_forward = base_model.forward
     base_model.forward = model_forward.__get__(base_model, Model)
