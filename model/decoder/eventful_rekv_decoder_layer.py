@@ -26,6 +26,7 @@ class EventfulLlamaDecoderLayer(LlamaDecoderLayer):
         cache_position=None,
         position_embeddings=None,
         output_attentions=False,
+        is_vanilla=False,
         **kwargs,
     ):
         """
@@ -53,15 +54,16 @@ class EventfulLlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
         
         # Self Attention - unpack 3 values: (attn_output, attn_weights, past_key_value)
-        hidden_states, _, past_key_value = self.self_attn(
+        hidden_states, past_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            position_ids=position_ids,
+            position_bias=position_ids,
             past_key_value=past_key_value,
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
             output_attentions=output_attentions,
+            is_vanilla=is_vanilla,
             **kwargs,
         )
         hidden_states = residual + hidden_states

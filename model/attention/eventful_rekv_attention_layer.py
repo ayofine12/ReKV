@@ -18,6 +18,7 @@ class EventfulLlamaAttention(LlamaAttention):
                 max_cached_block=16,
                 exc_block_size=256,
                 pin_memory=True,
+                async_global_stream=None,
     ):
         super().__init__(config, layer_idx)
         
@@ -31,6 +32,7 @@ class EventfulLlamaAttention(LlamaAttention):
         self.max_cached_block = max_cached_block
         self.exc_block_size = exc_block_size
         self.pin_memory = pin_memory
+        self.async_global_stream = async_global_stream
 
         # Eventful gates and accumulators for QKV
         self.qkv_gate = TokenGate()
@@ -42,12 +44,13 @@ class EventfulLlamaAttention(LlamaAttention):
         self,
         hidden_states: torch.Tensor,
         attention_mask = None,
-        position_ids = None,
+        position_bias = None,
         past_key_value = None,
         use_cache = False,
         cache_position = None,
         position_embeddings = None,
         output_attentions = False,
+        is_vanilla = False,
         **kwargs,
     ):
         assert not output_attentions
@@ -73,7 +76,9 @@ class EventfulLlamaAttention(LlamaAttention):
         attention_out = self.o_proj
 
         # qkv gate
-        hidden_states, index = self.qkv_gate(hidden_states)
+        if not is_vanilla:
+            hidden_states, index = self.qkv_gate(hidden_states)
+        hidden_states_shape = hidden_states.shape
         query = key_value = hidden_states
 
         batch_size = query.size(0)
@@ -85,18 +90,17 @@ class EventfulLlamaAttention(LlamaAttention):
         h_q = project_q(query)             # (batch, len_q, num_heads * dim_head)
         h_k = project_k(key_value)         # (batch, len_k, num_heads * dim_head)
         h_v = project_v(key_value)         # (batch, len_k, num_heads * dim_head)
-        
-        # Concatenate along the last dimension
-        h_qkv = torch.cat([h_q, h_k, h_v], dim=-1)  # (batch, len, 3 * num_heads * dim_head)
 
         # qkv accumulator
-        h_qkv = self.qkv_accumulator(h_qkv, index)
+        if not is_vanilla:
+            h_qkv = torch.cat([h_q, h_k, h_v], dim=-1)  # (batch, len, 3 * num_heads * dim_head)
+            h_qkv = self.qkv_accumulator(h_qkv, index)
         
-        # Split h_qkv back into h_q, h_k, h_v
-        hidden_dim = num_heads * dim_head
-        h_q = h_qkv[..., :hidden_dim]                           # (batch, len, num_heads * dim_head)
-        h_k = h_qkv[..., hidden_dim:2*hidden_dim]               # (batch, len, num_heads * dim_head)
-        h_v = h_qkv[..., 2*hidden_dim:]                         # (batch, len, num_heads * dim_head)
+            # Split h_qkv back into h_q, h_k, h_v
+            hidden_dim = num_heads * dim_head
+            h_q = h_qkv[..., :hidden_dim]                           # (batch, len, num_heads * dim_head)
+            h_k = h_qkv[..., hidden_dim:2*hidden_dim]               # (batch, len, num_heads * dim_head)
+            h_v = h_qkv[..., 2*hidden_dim:]                         # (batch, len, num_heads * dim_head)
 
         h_q = h_q.view(batch_size, len_q, num_heads, dim_head).permute(0, 2, 1, 3).contiguous()      # (batch, num_heads, len_q, dim_head)
         h_k = h_k.view(batch_size, len_k, num_heads_kv, dim_head).permute(0, 2, 1, 3).contiguous()   # (batch, num_heads_kv, len_k, dim_head)
@@ -210,15 +214,12 @@ class EventfulLlamaAttention(LlamaAttention):
 
             return o, past_key_value
 
-    def _forward_pre_attention(self, x):
-        x, index = self.qkv_gate(x)
-        return x, index
-
-
     def reset_self(self):
         """Reset for new sequence."""
         self.first = True
         self.qkv_gate.reset_self()
         self.qkv_accumulator.reset_self()
+        self.projection_gate.reset_self()
+        self.projection_accumulator.reset_self()
 
 

@@ -23,7 +23,7 @@ class Abstract_ReKV:
     def encode_init_prompt(self):
         if not isinstance(self.init_prompt_ids, torch.Tensor):
             self.init_prompt_ids = torch.as_tensor([self.init_prompt_ids], device=self.device)
-        output = self.language_model(input_ids=self.init_prompt_ids, use_cache=True, return_dict=True)
+        output = self.language_model(input_ids=self.init_prompt_ids, use_cache=True, return_dict=True, is_vanilla=True)
         self.kv_cache = output.past_key_values
         return
 
@@ -38,7 +38,7 @@ class Abstract_ReKV:
         return video_features
 
     def _prefill_video_chunk(self, video_features):
-        output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
+        output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True, is_vanilla=False)
         self.kv_cache = output.past_key_values
         return
 

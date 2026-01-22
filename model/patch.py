@@ -76,6 +76,7 @@ def patch_hf(
         output_attentions = None,
         output_hidden_states = None,
         return_dict = None,
+        is_vanilla=False,
         *args,
         **kwargs
     ):
@@ -125,6 +126,7 @@ def patch_hf(
                 past_key_value=past_key_values[i] if past_key_values is not None else None,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
+                is_vanilla=is_vanilla,
             )
 
             hidden_states = layer_outputs[0]
@@ -253,6 +255,11 @@ def patch_hf(
         
         # Replace attention in the new layer
         new_layer.self_attn = new_attention
+        
+        # Disable gradient computation for inference (memory optimization)
+        # Note: This is in addition to model.eval() and @torch.inference_mode()
+        # to ensure stateful modules (TokenGate, TokenBuffer) don't hold gradient graphs
+        new_layer.requires_grad_(False)
         
         new_layers.append(new_layer)
     

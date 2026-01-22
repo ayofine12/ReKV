@@ -219,6 +219,7 @@ def load_model(model_path='/mnt/models/Video-LLaVA-7B-hf', n_init=None, n_local=
         'chunk_size': chunk_size,
         'max_cached_block': 16,
         'exc_block_size': n_frame_tokens,
+        'async_global_stream': True,
         'pin_memory': True,
     }
     model = VideoLlava_ReKV.from_pretrained(
