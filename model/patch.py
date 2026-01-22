@@ -293,6 +293,51 @@ def patch_hf(
     
     # Delete old layers reference
     del old_layers
+    
+    # ============================================================
+    # Verification: Check if layers were properly replaced
+    # ============================================================
+    print("\n" + "=" * 70)
+    print("Patch Verification")
+    print("=" * 70)
+    
+    # Count EventfulLlamaDecoderLayer
+    eventful_layers = sum(1 for layer in base_model.layers 
+                         if isinstance(layer, EventfulLlamaDecoderLayer))
+    
+    # Count EventfulLlamaAttention
+    eventful_attentions = sum(1 for layer in base_model.layers 
+                             if isinstance(layer.self_attn, EventfulLlamaAttention))
+    
+    # Check position bias
+    has_position_bias = hasattr(base_model, 'position_bias')
+    
+    print(f"Total layers: {num_layers}")
+    print(f"EventfulLlamaDecoderLayer: {eventful_layers}/{num_layers} {'✓' if eventful_layers == num_layers else '✗ FAILED'}")
+    print(f"EventfulLlamaAttention: {eventful_attentions}/{num_layers} {'✓' if eventful_attentions == num_layers else '✗ FAILED'}")
+    print(f"Position bias (RoPE): {'✓' if has_position_bias else '✗ FAILED'}")
+    
+    # Show first and last layer types
+    first_layer_type = type(base_model.layers[0]).__name__
+    last_layer_type = type(base_model.layers[-1]).__name__
+    first_attn_type = type(base_model.layers[0].self_attn).__name__
+    
+    print(f"\nFirst layer: {first_layer_type}")
+    print(f"Last layer: {last_layer_type}")
+    print(f"First attention: {first_attn_type}")
+    
+    # Final status
+    all_passed = (eventful_layers == num_layers and 
+                  eventful_attentions == num_layers and 
+                  has_position_bias)
+    
+    if all_passed:
+        print("\n✓ SUCCESS: All layers properly replaced!")
+    else:
+        print("\n✗ WARNING: Some layers may not be properly replaced!")
+    
+    print("=" * 70 + "\n")
+    # ============================================================
 
     base_model._old_forward = base_model.forward
     base_model.forward = model_forward.__get__(base_model, Model)

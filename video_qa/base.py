@@ -18,6 +18,8 @@ import logzero
 from logzero import logger
 
 from model import llava_onevision_rekv, video_llava_rekv, longva_rekv
+from model.utils import set_policies
+from model.eventful_transformer.policies import TokenNormTopK, TokenNormTopFraction, TokenNormThreshold
 
 
 MODELS = {
@@ -196,6 +198,18 @@ def work(QA_CLASS):
     parser.add_argument("--retrieve_size", type=int, default=64)
     parser.add_argument("--retrieve_chunk_size", type=int, default=1)
     parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True)
+    
+    # EventfulTransformer policy arguments
+    parser.add_argument("--policy_type", type=str, default=None, 
+                        choices=[None, "topk", "top_fraction", "threshold"],
+                        help="Type of policy to use for TokenGate (None to disable)")
+    parser.add_argument("--policy_k", type=int, default=128,
+                        help="k value for topk policy")
+    parser.add_argument("--policy_fraction", type=float, default=0.5,
+                        help="Fraction value for top_fraction policy (0.0-1.0)")
+    parser.add_argument("--policy_threshold", type=float, default=0.1,
+                        help="Threshold value for threshold policy")
+    
     args = parser.parse_args()
 
     if not args.debug:
@@ -218,6 +232,20 @@ def work(QA_CLASS):
         topk=args.retrieve_size,
         chunk_size=args.retrieve_chunk_size,
     )
+    
+    # Set TokenGate policy if specified
+    if args.policy_type is not None:
+        if args.policy_type == "topk":
+            logger.info(f"Setting TokenGate policy: TokenNormTopK(k={args.policy_k})")
+            set_policies(videoqa_model, TokenNormTopK, k=args.policy_k)
+        elif args.policy_type == "top_fraction":
+            logger.info(f"Setting TokenGate policy: TokenNormTopFraction(fraction={args.policy_fraction})")
+            set_policies(videoqa_model, TokenNormTopFraction, fraction=args.policy_fraction)
+        elif args.policy_type == "threshold":
+            logger.info(f"Setting TokenGate policy: TokenNormThreshold(threshold={args.policy_threshold})")
+            set_policies(videoqa_model, TokenNormThreshold, threshold=args.policy_threshold)
+    else:
+        logger.info("No TokenGate policy set (policy_type=None)")
 
     # Load ground truth file
     anno = json.load(open(args.anno_path))
