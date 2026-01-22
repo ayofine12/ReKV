@@ -29,40 +29,44 @@ def set_policies(model, policy_class, **policy_kwargs):
         else:
             base_model = language_model
     elif hasattr(model, 'model'):
-        # LlamaForCausalLM case
         base_model = model.model
-        model_type = "LlamaForCausalLM"
     else:
-        # LlamaModel case
         base_model = model
-        model_type = "LlamaModel"
     
     # Iterate through decoder layers
     for _, layer in enumerate(base_model.layers):
-        # Check if layer has self_attn
-        if not hasattr(layer, 'self_attn'):
-            continue
+        gate_attr_names = ['qkv_gate', 'projection_gate', 'mlp_gate']
         
-        attention = layer.self_attn
-        
-        # Check direct attributes (for EventfulLlamaAttention)
-        gate_attr_names = ['qkv_gate', 'projection_gate', 'mlp_gate', 'v_gate', 'matmul_gate']
-        
+        # Check layer-level gates (e.g., mlp_gate in EventfulLlamaDecoderLayer)
         for attr_name in gate_attr_names:
-            if hasattr(attention, attr_name):
-                gate = getattr(attention, attr_name)
+            if hasattr(layer, attr_name):
+                gate = getattr(layer, attr_name)
                 gate_type_name = type(gate).__name__
                 
                 # Check by type name (handles import path issues)
                 is_gate = gate_type_name in ['SimpleSTGTGate', 'TokenDeltaGate', 'TokenGate']
-                
-                # Also check if it has policy attribute (more reliable)
                 has_policy_attr = hasattr(gate, 'policy')
                 
                 if is_gate or has_policy_attr:
-                    # Set policy
                     if has_policy_attr:
                         gate.policy = policy_class(**policy_kwargs)
+        
+        # Check attention-level gates (e.g., qkv_gate, projection_gate in EventfulLlamaAttention)
+        if hasattr(layer, 'self_attn'):
+            attention = layer.self_attn
+            
+            for attr_name in gate_attr_names:
+                if hasattr(attention, attr_name):
+                    gate = getattr(attention, attr_name)
+                    gate_type_name = type(gate).__name__
+                    
+                    # Check by type name (handles import path issues)
+                    is_gate = gate_type_name in ['SimpleSTGTGate', 'TokenDeltaGate', 'TokenGate']
+                    has_policy_attr = hasattr(gate, 'policy')
+                    
+                    if is_gate or has_policy_attr:
+                        if has_policy_attr:
+                            gate.policy = policy_class(**policy_kwargs)
     else:
         print(f"\n⚠ WARNING: No gates found in the model!")
         print("  This model may not have EventfulTransformer modules.")
