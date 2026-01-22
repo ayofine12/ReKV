@@ -265,8 +265,12 @@ def patch_hf(
         new_attention = EventfulLlamaAttention(config, i, **attn_kwargs)
         new_attention = new_attention.to(device)
         
-        # Copy weights from old attention to new attention
-        new_attention.load_state_dict(old_attention.state_dict(), strict=False)
+        # Reuse projection layers from old attention (memory efficient!)
+        # This avoids copying large weight matrices
+        new_attention.q_proj = old_attention.q_proj
+        new_attention.k_proj = old_attention.k_proj
+        new_attention.v_proj = old_attention.v_proj
+        new_attention.o_proj = old_attention.o_proj
         
         # Assign new attention
         new_layer.self_attn = new_attention
