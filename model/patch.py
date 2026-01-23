@@ -77,7 +77,7 @@ def patch_hf(
         output_attentions = None,
         output_hidden_states = None,
         return_dict = None,
-        is_vanilla=False,
+        is_init_prompt=False,
         *args,
         **kwargs
     ):
@@ -127,7 +127,7 @@ def patch_hf(
                 past_key_value=past_key_values[i] if past_key_values is not None else None,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
-                is_vanilla=is_vanilla,
+                is_init_prompt=is_init_prompt,
             )
 
             hidden_states = layer_outputs[0]
