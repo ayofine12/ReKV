@@ -64,7 +64,7 @@ class BaseVQA:
     def __init__(self, anno, save_dir, sample_fps,
                  qa_model, qa_processor=None,
                  num_chunks=None, chunk_idx=None,
-                 retrieve_size=64, chunk_size=1) -> None:
+                 retrieve_size=64, chunk_size=1, is_vanilla=False) -> None:
         
         self.sample_fps = sample_fps
 
@@ -86,6 +86,8 @@ class BaseVQA:
         self.save_dir = save_dir
         self.choice_letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
         self.record = {(self.retrieve_size, self.chunk_size): []}
+
+        self.is_vanilla = is_vanilla
 
     def split_list(self, lst, n):
         """Split a list into n (roughly) equal-sized chunks"""
@@ -209,6 +211,7 @@ def work(QA_CLASS):
                         help="Fraction value for top_fraction policy (0.0-1.0)")
     parser.add_argument("--policy_threshold", type=float, default=0.1,
                         help="Threshold value for threshold policy")
+    parser.add_argument("--is_vanilla", type=str2bool, nargs='?', const=True, default=False)
     
     args = parser.parse_args()
 
@@ -260,6 +263,7 @@ def work(QA_CLASS):
         num_chunks=args.num_chunks,
         chunk_idx=args.chunk_idx,
         save_dir=args.save_dir,
+        is_vanilla=args.is_vanilla,
     )
 
     retrieve_analyzer.analyze(debug=args.debug)

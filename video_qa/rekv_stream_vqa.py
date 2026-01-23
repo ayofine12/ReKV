@@ -66,7 +66,7 @@ class ReKVStreamVQA(BaseVQA):
         video_tensor = torch.from_numpy(video)
 
         self.qa_model.clear_cache()
-        self.qa_model.encode_init_prompt()
+        self.qa_model.encode_init_prompt(is_vanilla=self.is_vanilla)
 
         for sample in video_sample['conversations']:
             logger.debug(f'sample: {sample}')
@@ -79,7 +79,7 @@ class ReKVStreamVQA(BaseVQA):
             # encode video until receiving QA
             if temporal_windows[-1] > video_end_idx:
                 video_end_idx = temporal_windows[-1]
-                self.qa_model.encode_and_prefill_video(video_tensor[int(video_start_idx):int(video_end_idx)])
+                self.qa_model.encode_and_prefill_video(video_tensor[int(video_start_idx):int(video_end_idx)], is_vanilla=self.is_vanilla)
                 video_start_idx = video_end_idx
             
             break

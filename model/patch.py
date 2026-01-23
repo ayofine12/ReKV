@@ -78,6 +78,7 @@ def patch_hf(
         output_hidden_states = None,
         return_dict = None,
         is_init_prompt=False,
+        is_vanilla=False,
         *args,
         **kwargs
     ):
@@ -128,6 +129,7 @@ def patch_hf(
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 is_init_prompt=is_init_prompt,
+                is_vanilla=is_vanilla,
             )
 
             hidden_states = layer_outputs[0]

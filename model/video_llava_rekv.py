@@ -114,20 +114,20 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         logger.debug(f'video_features: {video_features.shape[1]}')
         return video_features
 
-    def _prefill_video_chunk(self, video_features):
-        output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
+    def _prefill_video_chunk(self, video_features, is_vanilla=False):
+        output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True, is_vanilla=is_vanilla)
         self.kv_cache = output.past_key_values
         self.print_kv_cache_info()
         return
 
-    def _encode_and_prefill_video_chunk(self, video_chunk):
+    def _encode_and_prefill_video_chunk(self, video_chunk, is_vanilla=False):
         video_features = self._encode_video_chunk(video_chunk)
-        self._prefill_video_chunk(video_features)
+        self._prefill_video_chunk(video_features, is_vanilla)
         return
 
     @torch.inference_mode()
-    def encode_and_prefill_video(self, video, encode_chunk_size=1):  # video: (Nv, H, W, 3)
-        super().encode_and_prefill_video(video, encode_chunk_size)
+    def encode_and_prefill_video(self, video, encode_chunk_size=1, is_vanilla=False):  # video: (Nv, H, W, 3)
+        super().encode_and_prefill_video(video, encode_chunk_size, is_vanilla)
 
     @torch.inference_mode()
     def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):

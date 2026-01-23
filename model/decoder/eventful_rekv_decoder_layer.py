@@ -27,6 +27,7 @@ class EventfulLlamaDecoderLayer(LlamaDecoderLayer):
         position_embeddings=None,
         output_attentions=False,
         is_init_prompt=False,
+        is_vanilla=False,
         **kwargs,
     ):
         """
@@ -64,6 +65,7 @@ class EventfulLlamaDecoderLayer(LlamaDecoderLayer):
             position_embeddings=position_embeddings,
             output_attentions=output_attentions,
             is_init_prompt=is_init_prompt,
+            is_vanilla=is_vanilla,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -72,10 +74,10 @@ class EventfulLlamaDecoderLayer(LlamaDecoderLayer):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        if not is_init_prompt:
+        if not is_init_prompt and not is_vanilla:
             hidden_states, index = self.mlp_gate(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if not is_init_prompt:
+        if not is_init_prompt and not is_vanilla    :
             hidden_states = self.mlp_accumulator(hidden_states, index)
         hidden_states = residual + hidden_states
         

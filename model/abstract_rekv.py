@@ -20,10 +20,10 @@ class Abstract_ReKV:
         torch.cuda.ipc_collect()
 
     @torch.inference_mode()
-    def encode_init_prompt(self):
+    def encode_init_prompt(self, is_vanilla=False):
         if not isinstance(self.init_prompt_ids, torch.Tensor):
             self.init_prompt_ids = torch.as_tensor([self.init_prompt_ids], device=self.device)
-        output = self.language_model(input_ids=self.init_prompt_ids, use_cache=True, return_dict=True, is_init_prompt=True)
+        output = self.language_model(input_ids=self.init_prompt_ids, use_cache=True, return_dict=True, is_init_prompt=True, is_vanilla=is_vanilla)
         self.kv_cache = output.past_key_values
         return
 
@@ -37,18 +37,18 @@ class Abstract_ReKV:
 
         return video_features
 
-    def _prefill_video_chunk(self, video_features):
-        output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True, is_init_prompt=False)
+    def _prefill_video_chunk(self, video_features, is_vanilla=False):
+        output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True, is_init_prompt=False, is_vanilla=is_vanilla)
         self.kv_cache = output.past_key_values
         return
 
-    def _encode_and_prefill_video_chunk(self, video_chunk):
+    def _encode_and_prefill_video_chunk(self, video_chunk, is_vanilla=False):
         video_features = self._encode_video_chunk(video_chunk)
-        self._prefill_video_chunk(video_features)
+        self._prefill_video_chunk(video_features, is_vanilla)
         return
 
     @torch.inference_mode()
-    def encode_and_prefill_video(self, video, encode_chunk_size=64):  # video: (Nv, H, W, 3)
+    def encode_and_prefill_video(self, video, encode_chunk_size=64, is_vanilla=False):  # video: (Nv, H, W, 3)
         # encode chunk by chunk
         num_frames = video.shape[0]
         num_chunks = num_frames // encode_chunk_size
@@ -57,7 +57,7 @@ class Abstract_ReKV:
             start_idx = chunk_idx * encode_chunk_size
             end_idx = start_idx + encode_chunk_size
             chunk_video = video[start_idx:end_idx]
-            self._encode_and_prefill_video_chunk(chunk_video)
+            self._encode_and_prefill_video_chunk(chunk_video, is_vanilla)
             logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.3f} GB')
 
         # Handle remaining frames
@@ -66,7 +66,7 @@ class Abstract_ReKV:
             start_idx = num_chunks * encode_chunk_size
             end_idx = start_idx + remaining_frames
             remaining_video = video[start_idx:end_idx]
-            self._encode_video_chunk(remaining_video)
+            self._encode_and_prefill_video_chunk(remaining_video)
         
         logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.1f} GB')
 

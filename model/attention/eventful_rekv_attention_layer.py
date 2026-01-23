@@ -51,6 +51,7 @@ class EventfulLlamaAttention(LlamaAttention):
         position_embeddings = None,
         output_attentions = False,
         is_init_prompt = False,
+        is_vanilla = False,
         **kwargs,
     ):
         assert not output_attentions
@@ -80,7 +81,7 @@ class EventfulLlamaAttention(LlamaAttention):
         len_k = hidden_states.size(1)
 
         # qkv gate
-        if not is_init_prompt:
+        if not is_init_prompt and not is_vanilla:
             hidden_states, index = self.qkv_gate(hidden_states)
         query = key_value = hidden_states
 
@@ -91,7 +92,7 @@ class EventfulLlamaAttention(LlamaAttention):
         h_v = project_v(key_value)         # (batch, len_k, num_heads * dim_head)
 
         # qkv accumulator
-        if not is_init_prompt:
+        if not is_init_prompt and not is_vanilla:
             h_qkv = torch.cat([h_q, h_k, h_v], dim=-1)  # (batch, len, 3 * num_heads * dim_head)
             h_qkv = self.qkv_accumulator(h_qkv, index)
         
@@ -211,11 +212,11 @@ class EventfulLlamaAttention(LlamaAttention):
             o = o.reshape(batch_size, len_q, dim_head * num_heads)
 
             # projection gate
-            if not is_init_prompt:
-                o, index = self.projection_gate(o)
+            if not is_init_prompt and not is_vanilla:
+                o, index = self.projection_gate(o)  
             o = attention_out(o)
             # projection accumulator
-            if not is_init_prompt:
+            if not is_init_prompt and not is_vanilla:
                 o = self.projection_accumulator(o, index)
 
             return o, past_key_value
