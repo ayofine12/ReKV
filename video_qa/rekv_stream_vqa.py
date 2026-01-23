@@ -56,6 +56,11 @@ class ReKVStreamVQA(BaseVQA):
     @torch.inference_mode()
     def analyze_a_video(self, video_sample):
         video_path = video_sample['video_path']
+        
+        # Only process specific video
+        if video_path != "/mnt/ssd1/mwnoh/rvs/ego/videos/879dd163-7588-45d1-9466-a5deabc59167.mp4":
+            return
+        
         video_start_idx = video_end_idx = 0
         video = self.load_video(video_path)
         video_tensor = torch.from_numpy(video)
