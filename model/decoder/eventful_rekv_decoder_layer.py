@@ -71,7 +71,12 @@ class EventfulLlamaDecoderLayer(LlamaDecoderLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+
+        if not is_vanilla:
+            hidden_states, index = self.mlp_gate(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if not is_vanilla:
+            hidden_states = self.mlp_accumulator(hidden_states, index)
         hidden_states = residual + hidden_states
         
         # Return format to match model_forward expectations:
