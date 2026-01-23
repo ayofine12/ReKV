@@ -82,7 +82,6 @@ class EventfulLlamaAttention(LlamaAttention):
         # qkv gate
         if not is_vanilla:
             hidden_states, index = self.qkv_gate(hidden_states)
-        hidden_states_shape = hidden_states.shape
         query = key_value = hidden_states
 
         assert use_cache   
@@ -90,15 +89,11 @@ class EventfulLlamaAttention(LlamaAttention):
         h_q = project_q(query)             # (batch, len_q, num_heads * dim_head)
         h_k = project_k(key_value)         # (batch, len_k, num_heads * dim_head)
         h_v = project_v(key_value)         # (batch, len_k, num_heads * dim_head)
-        h_q_shape = h_q.shape
-        h_k_shape = h_k.shape
-        h_v_shape = h_v.shape
 
         # qkv accumulator
         if not is_vanilla:
             h_qkv = torch.cat([h_q, h_k, h_v], dim=-1)  # (batch, len, 3 * num_heads * dim_head)
             h_qkv = self.qkv_accumulator(h_qkv, index)
-            h_qkv_shape = h_qkv.shape
         
             # Split h_qkv back into h_q, h_k, h_v
             hidden_dim = num_heads * dim_head
@@ -214,7 +209,14 @@ class EventfulLlamaAttention(LlamaAttention):
             )
             o = o.view(batch_size, num_heads, len_q, dim_head).permute(0, 2, 1, 3)
             o = o.reshape(batch_size, len_q, dim_head * num_heads)
+
+            # projection gate
+            if not is_vanilla:
+                o, index = self.projection_gate(o)
             o = attention_out(o)
+            # projection accumulator
+            if not is_vanilla:
+                o = self.projection_accumulator(o, index)
 
             return o, past_key_value
 
