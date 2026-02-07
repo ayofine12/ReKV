@@ -30,9 +30,11 @@ class ReKVStreamVQA(BaseVQA):
             else:
                 vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
                 fps = round(vr.get_avg_fps())
-                step = max(1, int(fps / self.sample_fps))
-                # frame_idx = [i for i in range(0, len(vr), step)]
-                frame_idx = np.linspace(0, 60, 200).tolist()
+                # step = max(1, int(fps / self.sample_fps))
+                step = 6
+                max_frames = 1800    
+                frame_idx = [i for i in range(0, max_frames, step)]
+                # frame_idx = np.linspace(0, 1, 200).tolist()
                 video = vr.get_batch(frame_idx).asnumpy()
                 np.save(cache_path, video)
         return video
