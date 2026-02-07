@@ -12,6 +12,7 @@ def rekv_attention_forward(
     exc_block_size, fattn,
     async_global_stream=True,
     pin_memory=False,
+    save_dir=None,
     *args, **kwargs
 ):
     Attn, _ = get_multi_stage_dot_production_attention(fattn)
@@ -22,6 +23,8 @@ def rekv_attention_forward(
                     past_key_value,
                     project_q, project_k, project_v, attention_out, 
                     dim_head, num_heads, num_heads_kv,
+                    context_info=None,
+                    layer_idx=0,
     ):
 
         """ 1. Project QKV """
@@ -56,6 +59,8 @@ def rekv_attention_forward(
                 fattn,
                 async_global_stream,
                 pin_memory,
+                save_dir=save_dir,
+                layer_idx=layer_idx,
             )
 
         local_q, local_k, local_v = h_q, h_k, h_v
@@ -140,6 +145,7 @@ def rekv_attention_forward(
             o = past_key_value.append(
                 local_q, local_k, local_v,
                 global_q, global_k, global_v,
+                context_info=context_info,
             )
             o = o.view(batch_size, num_heads, len_q, dim_head).permute(0, 2, 1, 3)
             o = o.reshape(batch_size, len_q, dim_head * num_heads)

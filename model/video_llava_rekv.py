@@ -107,23 +107,53 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         video_features = video_features.reshape(batch_size, frames * video_features.shape[1], -1)  # (B, Nv*257, D)
         return video_features
     
-    def _encode_video_chunk(self, video_chunk):
+    def _encode_video_chunk(self, video_chunk, chunk_idx=None):
         pixel_values_videos = self.processor.video_processor(images=None, videos=video_chunk, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
         video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*256, D)
         assert self.n_local >= video_features.shape[1], f'n_local: {self.n_local}, video_features: {video_features.shape[1]}'
         logger.debug(f'video_features: {video_features.shape[1]}')
-        self._prefill_video_chunk(video_features)
-        return
-
-    def _prefill_video_chunk(self, video_features):
-        output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
+        
+        context_info = {
+            'source': 'video',
+            'frame_idx': None,
+            'chunk_idx': chunk_idx,
+        }
+        
+        output = self.language_model(
+            inputs_embeds=video_features, 
+            past_key_values=self.kv_cache, 
+            use_cache=True, 
+            return_dict=True,
+            context_info=context_info
+        )
         self.kv_cache = output.past_key_values
         self.print_kv_cache_info()
         return
 
-    def _encode_and_prefill_video_chunk(self, video_chunk):
-        video_features = self._encode_video_chunk(video_chunk)
-        self._prefill_video_chunk(video_features)
+    def _prefill_video_chunk(self, video_features, chunk_idx=None):
+        context_info = {
+            'source': 'video',
+            'frame_idx': None,
+            'chunk_idx': chunk_idx,
+        }
+        
+        output = self.language_model(
+            inputs_embeds=video_features, 
+            past_key_values=self.kv_cache, 
+            use_cache=True, 
+            return_dict=True,
+            context_info=context_info
+        )
+        self.kv_cache = output.past_key_values
+        self.print_kv_cache_info()
+        return
+
+    def _encode_and_prefill_video_chunk(self, video_chunk, chunk_idx=None):
+        pixel_values_videos = self.processor.video_processor(images=None, videos=video_chunk, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
+        video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*256, D)
+        assert self.n_local >= video_features.shape[1], f'n_local: {self.n_local}, video_features: {video_features.shape[1]}'
+        logger.debug(f'video_features: {video_features.shape[1]}')
+        self._prefill_video_chunk(video_features, chunk_idx=chunk_idx)
         return
 
     @torch.inference_mode()
@@ -203,7 +233,7 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         return output
 
 
-def load_model(model_path='/mnt/models/Video-LLaVA-7B-hf', n_init=None, n_local=None, topk=8, chunk_size=1):
+def load_model(model_path='/mnt/models/Video-LLaVA-7B-hf', n_init=None, n_local=None, topk=8, chunk_size=1, save_dir=None):
     device = 'cuda'
     n_frame_tokens = 256
     processor = VideoLlavaProcessor.from_pretrained(model_path)
@@ -220,6 +250,7 @@ def load_model(model_path='/mnt/models/Video-LLaVA-7B-hf', n_init=None, n_local=
         'max_cached_block': 16,
         'exc_block_size': n_frame_tokens,
         'pin_memory': True,
+        'save_dir': save_dir,
     }
     model = VideoLlava_ReKV.from_pretrained(
         model_path, 

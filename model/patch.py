@@ -16,6 +16,8 @@ def huggingface_forward(forward):
         past_key_value = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        context_info=None,
+        layer_idx=0,
         **kwargs,
     ):
         assert not output_attentions
@@ -39,7 +41,9 @@ def huggingface_forward(forward):
             self, hidden_states, hidden_states,
             position_ids, use_cache, past_key_value,
             self.q_proj, self.k_proj, self.v_proj, self.o_proj, 
-            head_dim, num_heads, num_key_value_heads
+            head_dim, num_heads, num_key_value_heads,
+            context_info=context_info,
+            layer_idx=layer_idx
         )
         if use_cache:
             o, pkv = ret
@@ -75,6 +79,7 @@ def patch_hf(
         output_attentions = None,
         output_hidden_states = None,
         return_dict = None,
+        context_info = None,
         *args,
         **kwargs
     ):
@@ -124,6 +129,8 @@ def patch_hf(
                 past_key_value=past_key_values[i] if past_key_values is not None else None,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
+                context_info=context_info,
+                layer_idx=i,
             )
 
             hidden_states = layer_outputs[0]
@@ -167,6 +174,8 @@ def patch_hf(
         cache_position = None,
         position_embeddings = None,
         output_attentions = False,
+        context_info = None,
+        layer_idx = 0,
         **kwargs,
     ):
         
@@ -182,6 +191,8 @@ def patch_hf(
             cache_position=cache_position,
             position_embeddings=position_embeddings,
             output_attentions=output_attentions,
+            context_info=context_info,
+            layer_idx=layer_idx,
             **kwargs,
         )
         hidden_states = residual + hidden_states

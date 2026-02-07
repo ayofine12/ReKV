@@ -194,6 +194,8 @@ class ContextManager:
                  fattn: bool = False,
                  async_global_stream: bool = False,
                  pin_memory: bool = False,
+                 save_dir: str = None,
+                 layer_idx: int = 0,
     ):
 
         self.length = 0  # number of tokens in the KV-Cache
@@ -217,6 +219,18 @@ class ContextManager:
             GLOBAL_STREAM = torch.cuda.Stream()
 
         self.reset_retrieval()
+        
+        # For saving local_k and local_v to files
+        self.save_dir = save_dir
+        self.layer_idx = layer_idx
+        self.save_counter = 0
+        self.saved_files = []  # List of saved file paths with metadata
+        self.current_context = None
+        
+        # Create save directory if specified
+        if self.save_dir is not None:
+            import os
+            os.makedirs(self.save_dir, exist_ok=True)
 
     def _remove_lru_blocks(self, u, num_remove: Optional[int] = None, ignore_blocks = None):
         if num_remove is None:
@@ -333,6 +347,91 @@ class ContextManager:
         self.similarity = None
         self.retrieved_block_indices = None
         self.to_retrieve = False
+    
+    def _save_local_kv_to_file(self, local_k, local_v):
+        """Save local_k and local_v to a file with context information.
+        
+        Args:
+            local_k: (batch_size, n_head_kv, length, dim_head)
+            local_v: (batch_size, n_head_kv, length, dim_head)
+        """
+        if self.save_dir is None or self.current_context is None:
+            return
+        
+        import os
+        
+        # Create filename with context information
+        context = self.current_context
+        source = context.get('source', 'unknown')
+        chunk_idx = context.get('chunk_idx', None)
+        
+        if chunk_idx is not None:
+            filename = f"layer{self.layer_idx:02d}_{source}_chunk{chunk_idx:03d}_step{self.save_counter:04d}.pt"
+        else:
+            filename = f"layer{self.layer_idx:02d}_{source}_step{self.save_counter:04d}.pt"
+        
+        filepath = os.path.join(self.save_dir, filename)
+        
+        # Prepare data to save
+        save_data = {
+            'local_k': local_k.cpu(),  # Move to CPU before saving
+            'local_v': local_v.cpu(),
+            'context': self.current_context.copy(),
+            'timestamp': self.length,
+            'layer_idx': self.layer_idx,
+            'save_counter': self.save_counter,
+            'shape': {
+                'batch_size': local_k.size(0),
+                'n_head_kv': local_k.size(1),
+                'length': local_k.size(2),
+                'dim_head': local_k.size(3),
+            }
+        }
+        
+        # Save to file
+        torch.save(save_data, filepath)
+        
+        # Record saved file info (without storing the actual tensors in memory)
+        self.saved_files.append({
+            'filepath': filepath,
+            'filename': filename,
+            'context': self.current_context.copy(),
+            'timestamp': self.length,
+            'shape': save_data['shape'],
+        })
+        
+        self.save_counter += 1
+    
+    def get_saved_files_info(self, source=None, chunk_idx=None):
+        """Get information about saved files based on filters.
+        
+        Args:
+            source (str, optional): Filter by source ('init_prompt' or 'video')
+            chunk_idx (int, optional): Filter by chunk index
+            
+        Returns:
+            list: List of dictionaries with file information
+        """
+        results = []
+        for file_info in self.saved_files:
+            context = file_info['context']
+            if source is not None and context.get('source') != source:
+                continue
+            if chunk_idx is not None and context.get('chunk_idx') != chunk_idx:
+                continue
+            results.append(file_info)
+        return results
+    
+    def load_saved_kv(self, filepath):
+        """Load saved KV cache from a file.
+        
+        Args:
+            filepath (str): Path to the saved file
+            
+        Returns:
+            dict: Dictionary containing local_k, local_v, and metadata
+        """
+        return torch.load(filepath)
 
     def set_retrieved_block_indices(self, retrieved_block_indices):
         # retrieved_block_indices (list): batch_size x n_frames
@@ -617,6 +716,7 @@ class ContextManager:
         self,
         local_q, local_k, local_v,
         global_q, global_k, global_v,
+        context_info=None,
     ):
         # Pre-allocate GPU Memory.
         if not self.initialized:
@@ -634,6 +734,11 @@ class ContextManager:
         self.local_k = torch.cat((self.local_k, local_k), dim=-2)
         self.local_v = torch.cat((self.local_v, local_v), dim=-2)
         kv_length = self.local_k.size(-2)
+        
+        # Save local_k and local_v to file if context_info is provided
+        if context_info is not None:
+            self.current_context = context_info
+            self._save_local_kv_to_file(local_k, local_v)
 
         # append global remainder
         with torch.cuda.stream(GLOBAL_STREAM):

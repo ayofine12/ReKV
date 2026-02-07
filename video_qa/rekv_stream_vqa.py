@@ -19,11 +19,6 @@ class ReKVStreamVQA(BaseVQA):
             frame_idx = np.linspace(0, num_frames-1, int(num_frames*self.sample_fps), dtype=int).tolist()
             video = video[frame_idx]
         else:
-            # vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
-            # fps = round(vr.get_avg_fps())
-            # frame_idx = [i for i in range(0, len(vr), int(fps / self.sample_fps))]
-            # # frame_idx = [0, 60, 120]
-            # video = vr.get_batch(frame_idx).asnumpy()
             cache_root = Path(os.environ.get('REKV_VIDEO_CACHE_DIR', Path.home() / '.cache' / 'rekv_videos'))
             cache_root.mkdir(parents=True, exist_ok=True)
             cache_key = f"{video_path}|{self.sample_fps}"

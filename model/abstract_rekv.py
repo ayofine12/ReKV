@@ -23,7 +23,19 @@ class Abstract_ReKV:
     def encode_init_prompt(self):
         if not isinstance(self.init_prompt_ids, torch.Tensor):
             self.init_prompt_ids = torch.as_tensor([self.init_prompt_ids], device=self.device)
-        output = self.language_model(input_ids=self.init_prompt_ids, use_cache=True, return_dict=True)
+        
+        context_info = {
+            'source': 'init_prompt',
+            'frame_idx': None,
+            'chunk_idx': None,
+        }
+        
+        output = self.language_model(
+            input_ids=self.init_prompt_ids, 
+            use_cache=True, 
+            return_dict=True,
+            context_info=context_info
+        )
         self.kv_cache = output.past_key_values
         return
 
@@ -42,9 +54,23 @@ class Abstract_ReKV:
         self.kv_cache = output.past_key_values
         return
 
-    def _encode_and_prefill_video_chunk(self, video_chunk):
+    def _encode_and_prefill_video_chunk(self, video_chunk, chunk_idx=None):
         video_features = self._encode_video_chunk(video_chunk)
-        self._prefill_video_chunk(video_features)
+        
+        context_info = {
+            'source': 'video',
+            'frame_idx': None,  # Will be set in subclass if needed
+            'chunk_idx': chunk_idx,
+        }
+        
+        output = self.language_model(
+            inputs_embeds=video_features, 
+            past_key_values=self.kv_cache, 
+            use_cache=True, 
+            return_dict=True,
+            context_info=context_info
+        )
+        self.kv_cache = output.past_key_values
         return
 
     @torch.inference_mode()
@@ -57,7 +83,7 @@ class Abstract_ReKV:
             start_idx = chunk_idx * encode_chunk_size
             end_idx = start_idx + encode_chunk_size
             chunk_video = video[start_idx:end_idx]
-            self._encode_and_prefill_video_chunk(chunk_video)
+            self._encode_and_prefill_video_chunk(chunk_video, chunk_idx=chunk_idx)
             logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.3f} GB')
 
         # Handle remaining frames
@@ -66,7 +92,22 @@ class Abstract_ReKV:
             start_idx = num_chunks * encode_chunk_size
             end_idx = start_idx + remaining_frames
             remaining_video = video[start_idx:end_idx]
-            self._encode_video_chunk(remaining_video)
+            
+            context_info = {
+                'source': 'video',
+                'frame_idx': None,
+                'chunk_idx': num_chunks,  # Last chunk index
+            }
+            
+            video_features = self._encode_video_chunk(remaining_video)
+            output = self.language_model(
+                inputs_embeds=video_features, 
+                past_key_values=self.kv_cache, 
+                use_cache=True, 
+                return_dict=True,
+                context_info=context_info
+            )
+            self.kv_cache = output.past_key_values
         
         logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.1f} GB')
 
